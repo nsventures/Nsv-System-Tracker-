@@ -178,7 +178,8 @@
   },
   "build": {
     "productName": "NS Ventures",
-    "appId": "org.erb.ElectronReact",
+    "executableName": "ns-ventures",
+    "appId": "com.nsventures.systemtracker",
     "asar": true,
     "afterSign": ".erb/scripts/notarize.js",
     "asarUnpack": "**\\*.{node,dll}",
