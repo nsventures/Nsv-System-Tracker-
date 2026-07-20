@@ -27,6 +27,10 @@ import { URL } from 'url';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
 
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('no-sandbox');
+}
+
 class AppUpdater {
   constructor() {
     log.transports.file.level = 'info';
