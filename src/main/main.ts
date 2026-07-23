@@ -468,11 +468,14 @@ function setAutoLaunch(enable: boolean): boolean {
       openAsHidden: false,
     };
 
-    // An AppImage runs from a temporary mountpoint, so process.execPath is not
-    // a stable launcher to autostart. $APPIMAGE is the file the user keeps.
-    if (process.platform === 'linux' && process.env.APPIMAGE) {
-      settings.path = process.env.APPIMAGE;
-      settings.args = [];
+    // Autostart launches the binary directly, bypassing the desktop entry that
+    // carries --no-sandbox, so the flag has to be repeated here or the app
+    // aborts at login on distros that restrict unprivileged user namespaces.
+    if (process.platform === 'linux') {
+      // An AppImage runs from a temporary mountpoint, so process.execPath is
+      // not a stable launcher to autostart. $APPIMAGE is the file the user keeps.
+      settings.path = process.env.APPIMAGE || process.execPath;
+      settings.args = ['--no-sandbox'];
     }
 
     app.setLoginItemSettings(settings);
@@ -590,16 +593,70 @@ const createWindow = async () => {
     },
   });
 
-  mainWindow.loadURL(resolveHtmlPath('index.html'));
+  const startUrl = resolveHtmlPath('index.html');
+  console.log(`[DEBUG] Main process: Loading renderer from ${startUrl}`);
+  mainWindow.loadURL(startUrl);
+
+  // The window is created hidden and only revealed on 'ready-to-show'. If the
+  // renderer fails to load, that event never fires and the app sits running
+  // with no window and no error — indistinguishable from "it doesn't open".
+  // These handlers make every such failure visible instead of silent.
+  let hasShownWindow = false;
+  const showMainWindow = (reason: string) => {
+    if (hasShownWindow || !mainWindow) return;
+    hasShownWindow = true;
+    console.log(`[DEBUG] Main process: Showing window (${reason})`);
+    if (process.env.START_MINIMIZED) {
+      mainWindow.minimize();
+    } else {
+      mainWindow.show();
+    }
+  };
+
+  mainWindow.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedURL) => {
+      console.error(
+        `[DEBUG] Main process: Renderer failed to load ${validatedURL} — ${errorDescription} (${errorCode})`,
+      );
+      showMainWindow('did-fail-load');
+    },
+  );
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error(
+      `[DEBUG] Main process: Renderer process gone — reason: ${details.reason}, exitCode: ${details.exitCode}`,
+    );
+  });
+
+  mainWindow.webContents.on('unresponsive', () => {
+    console.warn('[DEBUG] Main process: Renderer is unresponsive');
+  });
+
+  // Last resort: never leave the user staring at nothing.
+  const showFallbackTimer = setTimeout(() => {
+    if (!hasShownWindow) {
+      console.warn(
+        '[DEBUG] Main process: ready-to-show did not fire within 15s, showing window anyway',
+      );
+      showMainWindow('fallback timeout');
+    }
+  }, 15000);
+
+  mainWindow.on('closed', () => {
+    clearTimeout(showFallbackTimer);
+  });
 
   mainWindow.on('ready-to-show', () => {
     if (!mainWindow) {
       throw new Error('"mainWindow" is not defined');
     }
+    clearTimeout(showFallbackTimer);
     if (process.env.START_MINIMIZED) {
       mainWindow.minimize();
+      hasShownWindow = true;
     } else {
-      mainWindow.show();
+      showMainWindow('ready-to-show');
 
       // Automatically enable startup on login (Windows, macOS and Linux)
       if (process.env.NODE_ENV === 'production') {
@@ -770,6 +827,12 @@ app.on('window-all-closed', () => {
 app
   .whenReady()
   .then(() => {
+    // One line that makes a terminal launch self-diagnosing on any platform.
+    console.log(
+      `[DEBUG] Main process: Starting ${app.getName()} ${app.getVersion()} — ` +
+        `electron ${process.versions.electron}, ${process.platform}/${process.arch}, ` +
+        `packaged=${app.isPackaged}, userData=${app.getPath('userData')}`,
+    );
     createWindow();
     app.on('activate', () => {
       // On macOS it's common to re-create a window in the app when the

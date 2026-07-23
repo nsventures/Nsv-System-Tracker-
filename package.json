@@ -259,11 +259,11 @@
       "category": "Office",
       "synopsis": "Employee time tracking and productivity monitoring",
       "maintainer": "NS Ventures <support@nsventures.example.com>",
+      "executableArgs": [
+        "--no-sandbox"
+      ],
       "desktop": {
-        "entry": {
-          "StartupNotify": "true",
-          "StartupWMClass": "ns-ventures"
-        }
+        "StartupNotify": "true"
       }
     },
     "directories": {
