@@ -1,8 +1,10 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { whiteLabelConfig } from '../../../whiteLabel.config';
 import { User } from '../../types';
-import logo from '../../../../assets/nsv-logo-new.webp';
-import logoBlack from '../../../../assets/nsv-black.png';
+// nsv-logo-new.webp is the white wordmark, legible on a dark background;
+// nsv-black.png is the black one, legible on a light background.
+import darkThemeLogo from '../../../../assets/nsv-logo-new.webp';
+import lightThemeLogo from '../../../../assets/nsv-black.png';
 
 interface UserHeaderProps {
   user: User;
@@ -69,7 +71,7 @@ function UserHeader({
   return (
     <header className="dashboard-header">
       <img
-        src={logo}
+        src={theme === 'dark' ? darkThemeLogo : lightThemeLogo}
         alt={whiteLabelConfig.ui.dashboardTitle}
         className="dashboard-logo"
         style={{ height: '40px', width: 'auto' }}
