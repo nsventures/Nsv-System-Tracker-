@@ -585,7 +585,9 @@ const createWindow = async () => {
     height: 800,
     resizable: false,
     maximizable: false,
-    icon: getAssetPath('nsv.png'),
+    // Square 512px source: nsv.png is 104x123, which Windows and GNOME both
+    // letterbox into a smudge at taskbar sizes.
+    icon: getAssetPath('nsv512x512.png'),
     webPreferences: {
       preload: app.isPackaged
         ? path.join(__dirname, 'preload.js')
