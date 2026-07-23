@@ -5,6 +5,7 @@ import * as databaseService from './database';
 // eslint-disable-next-line import/no-cycle
 import screenshotService from './screenshot';
 import { whiteLabelConfig } from '../../whiteLabel.config';
+import { formatApiTimestamp } from '../utils/timeUtils';
 
 // Activity types
 export type ActivityAction =
@@ -53,6 +54,15 @@ class ActivityService {
   private breakEndTimeout: NodeJS.Timeout | null = null;
 
   private nextAutoBreakEligibleAt: number = 0; // Prevent immediate re-auto-start after manual stop
+
+  private lastClockInAt: number = 0; // Epoch ms of the most recent clock-in, for the grace window below
+
+  // A user cannot legitimately be force-clocked-out seconds after clocking in.
+  // A FORCE_CLOCKOUT arriving inside this window means the server could not see
+  // the clock-in that just succeeded, so it is ignored as a server-side fault
+  // rather than acted on. A genuine admin clock-out that lands in the window is
+  // still caught on the next screenshot cycle, so nothing is permanently missed.
+  private static readonly FORCE_CLOCKOUT_GRACE_MS = 90000; // 90s
 
   // Initialize the service with user data
   public async initialize(userId: number, workspaceId: number, token: string) {
@@ -567,24 +577,7 @@ class ActivityService {
       return;
     }
 
-    const now = new Date();
-
-    const options: Intl.DateTimeFormatOptions = {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-      timeZone: whiteLabelConfig.timezone.default,
-    };
-
-    const formattedDate = now
-      .toLocaleString('en-US', options)
-      .replace(/(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+):(\d+)/, '$3-$1-$2 $4:$5:$6');
-
-    const timestamp = formattedDate;
+    const timestamp = formatApiTimestamp();
 
     const logData: LogUpdateRequest = {
       user_id: this.userId,
@@ -602,7 +595,7 @@ class ActivityService {
         );
         if (response && response.error && response.code === 'FORCE_CLOCKOUT') {
           console.warn('Received FORCE_CLOCKOUT from server during logUpdate');
-          await this.handleForceClockout();
+          await this.handleForceClockout(`log-update:${action}`);
           return;
         }
       } else {
@@ -622,6 +615,7 @@ class ActivityService {
     if (this.isOnBreak) {
       this.stopBreak();
     }
+    this.lastClockInAt = Date.now();
     await this.logActivity('clock-in');
     this.updateSessionFile(true);
 
@@ -707,24 +701,7 @@ class ActivityService {
 
   // Manually stop manual time tracking with reason
   public async stopManualTime(reason: string) {
-    const now = new Date();
-
-    const options: Intl.DateTimeFormatOptions = {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-      timeZone: whiteLabelConfig.timezone.default,
-    };
-
-    const formattedDate = now
-      .toLocaleString('en-US', options)
-      .replace(/(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+):(\d+)/, '$3-$1-$2 $4:$5:$6');
-
-    const timestamp = formattedDate;
+    const timestamp = formatApiTimestamp();
 
     const logData: LogUpdateRequest = {
       user_id: this.userId!,
@@ -867,8 +844,60 @@ class ActivityService {
   }
 
   // Handle a force clockout triggered by the server
-  public async handleForceClockout() {
-    console.log('[DEBUG] Executing local handleForceClockout');
+  public async handleForceClockout(source: string = 'unknown') {
+    console.log(
+      `[DEBUG] Executing local handleForceClockout (source: ${source})`,
+    );
+
+    // Grace window: reject a force-clockout that lands immediately after our
+    // own clock-in. That combination is self-contradictory and indicates the
+    // server failed to see the clock-in, not that the user was really kicked.
+    const sinceClockIn = Date.now() - this.lastClockInAt;
+    if (
+      this.lastClockInAt > 0 &&
+      sinceClockIn < ActivityService.FORCE_CLOCKOUT_GRACE_MS
+    ) {
+      console.error(
+        `[DEBUG] IGNORING FORCE_CLOCKOUT (source: ${source}) — arrived ${Math.round(
+          sinceClockIn / 1000,
+        )}s after a successful clock-in. The server cannot see our clock-in; ` +
+          `this is a server-side fault, not a real clock-out.`,
+      );
+      return;
+    }
+
+    // Idempotency guard. The server keeps returning FORCE_CLOCKOUT for as long
+    // as the user is clocked out server-side, so this can be invoked once per
+    // sync cycle for the same underlying state. Without this, every cycle would
+    // append another clock-out row and re-notify the user indefinitely.
+    if (!(await this.isUserClockedIn())) {
+      console.log(
+        `[DEBUG] handleForceClockout (source: ${source}) skipped: already clocked out locally`,
+      );
+      // Still make sure tracking is actually stopped before returning.
+      screenshotService.stop();
+      return;
+    }
+
+    // Dump the local clock state that was in effect when the server rejected
+    // us. A FORCE_CLOCKOUT arriving moments after our own clock-in means the
+    // server could not see that clock-in — compare these timestamps against
+    // the server's stored rows to find the mismatch.
+    try {
+      const recent = (await databaseService.getActivityLogs())
+        .filter(
+          (log) =>
+            log.user_id === this.userId &&
+            (log.action === 'clock-in' || log.action === 'clock-out'),
+        )
+        .slice(-5);
+      console.warn(
+        `[DEBUG] FORCE_CLOCKOUT received (source: ${source}). Last local clock events:`,
+        recent.map((l) => `${l.action}@${l.timestamp} synced=${l.synced}`),
+      );
+    } catch (dumpError) {
+      console.error('[DEBUG] Could not dump clock state:', dumpError);
+    }
 
     // 1. Stop screenshots
     console.log('[DEBUG] Stopping screenshot service');
@@ -887,25 +916,10 @@ class ActivityService {
     }
 
     // 3. Log clock-out locally
-    const now = new Date();
-    const options = {
-      year: 'numeric' as const,
-      month: '2-digit' as const,
-      day: '2-digit' as const,
-      hour: '2-digit' as const,
-      minute: '2-digit' as const,
-      second: '2-digit' as const,
-      hour12: false,
-      timeZone: whiteLabelConfig.timezone.default,
-    };
-    const formattedDate = now
-      .toLocaleString('en-US', options)
-      .replace(/(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+):(\d+)/, '$3-$1-$2 $4:$5:$6');
-
     const clockOutLog = {
       user_id: this.userId!,
       action: 'clock-out' as const,
-      timestamp: formattedDate,
+      timestamp: formatApiTimestamp(),
       reason: 'Forcefully clocked out by administrator',
     };
 

@@ -17,6 +17,10 @@ import {
 } from '../services';
 import { UNAUTHORIZED_EVENT } from '../services/api';
 
+// How long logout waits for a best-effort flush of pending data before it
+// clears the session anyway.
+const LOGOUT_SYNC_TIMEOUT_MS = 8000;
+
 // Define the context type
 interface AuthContextType {
   auth: Auth | null;
@@ -223,18 +227,31 @@ export function AuthProvider({ children }: AuthProviderProps) {
         await activityService.clockOut();
       }
 
-      // Sync any unsynced data (including the clock-out event if online) before clearing token
-      await networkService.syncData();
-
-      // Clean up services
-      activityService.cleanup();
-      screenshotService.stop();
-
-      // Clear auth data
-      await databaseService.clearAuth();
-      setAuth(null);
+      // Sync any unsynced data (including the clock-out event if online) before
+      // clearing the token — but only for a bounded window. syncData() uploads
+      // the screenshot backlog serially, which can run for minutes (or never
+      // finish if the server keeps rejecting), and awaiting it unbounded meant
+      // logout appeared to do nothing at all. Whatever does not make it stays
+      // queued locally and syncs after the next login.
+      await Promise.race([
+        networkService.syncData(),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, LOGOUT_SYNC_TIMEOUT_MS);
+        }),
+      ]);
     } catch (error) {
       console.error('Logout error:', error);
+    } finally {
+      // Always tear down, even if the clock-out or sync above failed —
+      // otherwise the user is stuck on the dashboard.
+      try {
+        activityService.cleanup();
+        screenshotService.stop();
+        await databaseService.clearAuth();
+      } catch (cleanupError) {
+        console.error('Logout cleanup error:', cleanupError);
+      }
+      setAuth(null);
     }
   }, []);
 

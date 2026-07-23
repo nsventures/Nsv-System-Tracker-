@@ -20,6 +20,50 @@ const isOnline = (): boolean => {
 // Custom event for unauthorized responses
 export const UNAUTHORIZED_EVENT = 'api:unauthorized';
 
+// Normalize a non-2xx response body into our ApiResponse shape.
+// The server signals rejections with an HTTP status and a body like
+// { message: 'FORCE_CLOCKOUT', code: 'FORCE_CLOCKOUT' } that carries no
+// `error` flag. Without this, `!response.error` reads as success and a
+// rejected log/screenshot gets marked synced (and its local file deleted).
+function normalizeErrorResponse<T>(
+  status: number,
+  body: Partial<ApiResponse<T>> | null,
+): ApiResponse<T> {
+  return {
+    ...(body || {}),
+    error: true,
+    message: body?.message || `Request failed with status ${status}`,
+    // Fall back to `message` so a body that only carries FORCE_CLOCKOUT there
+    // is still recognized by the force-clockout handlers.
+    code: body?.code || body?.message,
+    status,
+  } as ApiResponse<T>;
+}
+
+// A 4xx (other than FORCE_CLOCKOUT, handled separately) means the server will
+// reject this payload every time — e.g. 422 validation. Retrying it on the 60s
+// sync loop would repeat forever, so such logs are dropped from the queue.
+// 5xx and network failures have no `status` here and stay retryable.
+function isTerminalRejection<T>(response: ApiResponse<T>): boolean {
+  return (
+    typeof response.status === 'number' &&
+    response.status >= 400 &&
+    response.status < 500 &&
+    response.code !== 'FORCE_CLOCKOUT'
+  );
+}
+
+// Parse a JSON body without throwing on empty/non-JSON error responses
+async function parseJsonSafely<T>(
+  response: Response,
+): Promise<Partial<ApiResponse<T>> | null> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 // Helper function to make API requests
 async function apiRequest<T>(
   endpoint: string,
@@ -60,8 +104,19 @@ async function apiRequest<T>(
       };
     }
 
-    const responseData: ApiResponse<T> = await response.json();
-    return responseData;
+    const body = await parseJsonSafely<T>(response);
+
+    // A rejection (e.g. 403 FORCE_CLOCKOUT) may arrive without an `error` flag.
+    // Derive it from the status so downstream success checks stay correct.
+    if (!response.ok) {
+      const normalized = normalizeErrorResponse<T>(response.status, body);
+      console.warn(
+        `[API] ${endpoint} rejected with status ${response.status}, code: ${normalized.code}`,
+      );
+      return normalized;
+    }
+
+    return (body || { error: false, message: '' }) as ApiResponse<T>;
   } catch (error) {
     console.error('API request failed:', error);
     return {
@@ -177,9 +232,16 @@ export async function logUpdate(
     workspaceId,
   );
 
-  if (!response.error && response.data) {
-    // Mark all activity logs as synced instead of deleting them to maintain complete history
-    console.log(`[DEBUG] API: Marking ${logData.action} log as synced`);
+  // Any non-error response means the server accepted the punch, deduped it, or
+  // deliberately ignored it (code: 'NOOP' for a redundant/out-of-order punch).
+  // All three are terminal — mark it synced so it is not retried forever.
+  // Do NOT also require `response.data`: no-op and duplicate responses may omit it.
+  if (!response.error) {
+    console.log(
+      `[DEBUG] API: Marking ${logData.action} log as synced${
+        response.code ? ` (code: ${response.code})` : ''
+      }`,
+    );
     await databaseService.markActivityLogAsSynced(savedLog.id!);
   }
 
@@ -190,10 +252,10 @@ export async function logUpdate(
 export async function syncUnsyncedLogs(
   token: string,
   workspaceId: number,
-): Promise<void> {
+): Promise<boolean> {
   if (!isOnline()) {
     console.log('[API] Cannot sync logs: offline');
-    return; // Can't sync if offline
+    return false; // Can't sync if offline
   }
 
   const unsyncedLogs = await databaseService.getUnsyncedActivityLogs();
@@ -209,8 +271,10 @@ export async function syncUnsyncedLogs(
 
   if (sortedLogs.length === 0) {
     console.log('[API] No unsynced logs to sync');
-    return;
+    return false;
   }
+
+  let forceClockoutDetected = false;
 
   for (const log of sortedLogs) {
     console.log(
@@ -225,7 +289,27 @@ export async function syncUnsyncedLogs(
       workspaceId,
     );
 
-    if (!response.error) {
+    if (response && response.error && response.code === 'FORCE_CLOCKOUT') {
+      // The user is clocked out server-side, so this punch will be rejected on
+      // every future attempt. Retire it from the queue — leaving it unsynced
+      // made each 60s sync cycle re-POST it, re-trigger the force-clockout
+      // handler and re-notify the user indefinitely. Keep draining the rest of
+      // the queue (a queued clock-in later in the batch is still acceptable to
+      // the server) and report the force-clockout once, at the end.
+      console.warn(
+        `[API] FORCE_CLOCKOUT while syncing ${log.action} at ${log.timestamp} — retiring from queue`,
+      );
+      await databaseService.markActivityLogAsSynced(id!);
+      forceClockoutDetected = true;
+    } else if (isTerminalRejection(response)) {
+      // Permanently rejected (e.g. 422 validation). Retrying would loop forever
+      // on the 60s sync cycle, so retire it from the queue and log loudly.
+      console.error(
+        `[API] Dropping permanently rejected log: ${log.action} at ${log.timestamp} ` +
+          `(status ${response.status}, code: ${response.code}, message: ${response.message})`,
+      );
+      await databaseService.markActivityLogAsSynced(id!);
+    } else if (!response.error) {
       // Mark all activity logs as synced instead of deleting them to maintain complete history
       console.log(`[API] Marking ${logData.action} log as synced during sync`);
       await databaseService.markActivityLogAsSynced(id!);
@@ -238,6 +322,7 @@ export async function syncUnsyncedLogs(
   }
 
   console.log('[API] Finished syncing activity logs');
+  return forceClockoutDetected;
 }
 
 // Check auth status
@@ -277,8 +362,11 @@ export async function uploadScreenshot(
     try {
       console.log('[DEBUG] API: Attempting to read file using Electron IPC');
 
-      // Get the filename from the path
-      const filename = filePath.split('/').pop() || 'screenshot.png';
+      // Get the filename from the path. Split on both separators: main.ts
+      // builds this path with path.join(), so it is backslash-separated on
+      // Windows and splitting on '/' alone sent the entire absolute path
+      // ("C:\Users\...\screenshot-x.png") as the multipart filename.
+      const filename = filePath.split(/[\\/]/).pop() || 'screenshot.png';
       console.log(`[DEBUG] API: Filename extracted: ${filename}`);
 
       // Read the file as base64 using the main process
@@ -353,9 +441,23 @@ export async function uploadScreenshot(
       `[DEBUG] API: Received response with status: ${uploadResponse.status}`,
     );
 
-    const responseData = await uploadResponse.json();
+    const responseData = await parseJsonSafely<any>(uploadResponse);
     console.log(`[DEBUG] API: Response data: ${JSON.stringify(responseData)}`);
-    return responseData;
+
+    // Same normalization as apiRequest: without it a 403 FORCE_CLOCKOUT reads
+    // as success and the local screenshot file is deleted from disk.
+    if (!uploadResponse.ok) {
+      const normalized = normalizeErrorResponse<any>(
+        uploadResponse.status,
+        responseData,
+      );
+      console.warn(
+        `[API] Screenshot upload rejected with status ${uploadResponse.status}, code: ${normalized.code}`,
+      );
+      return normalized;
+    }
+
+    return (responseData || { error: false, message: '' }) as ApiResponse<any>;
   } catch (error) {
     console.error(`[DEBUG] API: Error uploading screenshot: ${error}`);
     return {
@@ -369,20 +471,41 @@ export async function uploadScreenshot(
 export async function syncUnsyncedScreenshots(
   token: string,
   workspaceId: number,
-): Promise<void> {
+): Promise<boolean> {
   if (!isOnline()) {
-    return; // Can't sync if offline
+    return false; // Can't sync if offline
   }
 
   const unsyncedScreenshots = await databaseService.getUnsyncedScreenshots();
+  console.log(
+    `[API] Found ${unsyncedScreenshots.length} unsynced screenshots to sync`,
+  );
 
   for (const screenshot of unsyncedScreenshots) {
+    console.log(
+      `[API] Syncing screenshot: ${screenshot.filePath} (ID: ${screenshot.id})`,
+    );
     const response = await uploadScreenshot(
       token,
       workspaceId,
       screenshot.filePath,
       screenshot.timestamp,
     );
+
+    if (response && response.error && response.code === 'FORCE_CLOCKOUT') {
+      // The user is clocked out server-side. Unlike an activity log — a
+      // discrete event the server refuses permanently — a screenshot captured
+      // before the clock-out is real work product, so it is KEPT for retry
+      // rather than discarded. Stop after this one rejection instead of pushing
+      // the whole backlog at a server that will refuse all of it; the
+      // idempotency guard in handleForceClockout() prevents the repeat
+      // rejections from re-notifying the user each cycle.
+      console.warn(
+        `[API] FORCE_CLOCKOUT while syncing screenshots — preserving backlog of ` +
+          `${unsyncedScreenshots.length} screenshot(s) for retry after next clock-in`,
+      );
+      return true;
+    }
 
     if (!response.error) {
       // Delete the record from the local database once synced
@@ -402,6 +525,10 @@ export async function syncUnsyncedScreenshots(
       }
     }
   }
+
+  // Reaching here means the whole queue drained without a force-clockout.
+  console.log('[API] Finished syncing screenshots');
+  return false;
 }
 
 // Export the API service

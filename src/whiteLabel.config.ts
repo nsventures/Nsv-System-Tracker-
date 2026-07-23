@@ -1,9 +1,4 @@
-/**
- * White Label Configuration
- *
- * This file contains all the configurable elements for white labeling the application.
- * Modify these values to customize the branding of the application.
- */
+
 
 export const whiteLabelConfig = {
   // Application Information
@@ -16,7 +11,7 @@ export const whiteLabelConfig = {
     copyright: `© ${new Date().getFullYear()} Taskify Inc.`,
     website: 'https://nsventures.example.com',
     supportEmail: 'support@nsventures.example.com',
-    apiBaseUrl: 'http://localhost/api/plugin/timetracker', // API endpoint URL
+    apiBaseUrl: 'https://app.nsventures.in/api/plugin/timetracker', // API endpoint URL
   },
 
   // Timezone Configuration

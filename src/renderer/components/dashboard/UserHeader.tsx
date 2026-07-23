@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import { whiteLabelConfig } from '../../../whiteLabel.config';
 import { User } from '../../types';
 import logo from '../../../../assets/nsv-logo-new.webp';
@@ -10,7 +10,7 @@ interface UserHeaderProps {
   isDropdownOpen: boolean;
   toggleDropdown: () => void;
   toggleTheme: () => void;
-  logout: () => void;
+  logout: () => void | Promise<void>;
 }
 
 function UserHeader({
@@ -22,6 +22,19 @@ function UserHeader({
   logout,
 }: UserHeaderProps): React.ReactElement {
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+
+  // Logout flushes pending data before it clears the session, so it can take a
+  // few seconds. Show that it is working and ignore repeat clicks meanwhile.
+  const handleLogout = async () => {
+    if (isLoggingOut) return;
+    setIsLoggingOut(true);
+    try {
+      await logout();
+    } finally {
+      setIsLoggingOut(false);
+    }
+  };
 
   // Handle clicks outside the dropdown to close it
   useEffect(() => {
@@ -56,7 +69,7 @@ function UserHeader({
   return (
     <header className="dashboard-header">
       <img
-        src={theme === 'light' ? logoBlack : logo}
+        src={logo}
         alt={whiteLabelConfig.ui.dashboardTitle}
         className="dashboard-logo"
         style={{ height: '40px', width: 'auto' }}
@@ -97,16 +110,18 @@ function UserHeader({
           </div>
           <div
             className="dropdown-item logout"
-            onClick={logout}
+            onClick={handleLogout}
             role="button"
             tabIndex={0}
+            aria-disabled={isLoggingOut}
+            style={isLoggingOut ? { opacity: 0.6, pointerEvents: 'none' } : {}}
             onKeyDown={(e) => {
               if (e.key === 'Enter' || e.key === ' ') {
-                logout();
+                handleLogout();
               }
             }}
           >
-            Logout
+            {isLoggingOut ? 'Logging out…' : 'Logout'}
           </div>
         </div>
       </div>

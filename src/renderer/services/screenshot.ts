@@ -4,6 +4,7 @@ import databaseService from './database';
 // Note: networkService import removed as unused
 import activityService from './activity';
 import whiteLabelConfig from '../../whiteLabel.config';
+import { formatApiTimestamp } from '../utils/timeUtils';
 
 class ScreenshotService {
   private screenshotInterval: number = 300000; // Default: 5 minutes (in milliseconds)
@@ -145,27 +146,9 @@ class ScreenshotService {
         return;
       }
 
-      // Get current timestamp in the format expected by the API with timezone awareness
-      // Create a date object for the current time
-      const now = new Date();
-
-      const options: Intl.DateTimeFormatOptions = {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-        timeZone: whiteLabelConfig.timezone.default,
-      };
-
-      const timestamp = now
-        .toLocaleString('en-US', options)
-        .replace(
-          /(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+):(\d+)/,
-          '$3-$1-$2 $4:$5:$6',
-        );
+      // Get current timestamp in the format expected by the API (ISO-8601 with
+      // an explicit UTC offset, so the server need not infer a timezone)
+      const timestamp = formatApiTimestamp();
 
       console.log(
         `[DEBUG] Generated timestamp with timezone ${whiteLabelConfig.timezone.default}: ${timestamp}`,
@@ -212,7 +195,7 @@ class ScreenshotService {
               'Received FORCE_CLOCKOUT from server during screenshot upload',
             );
             // eslint-disable-next-line @typescript-eslint/no-floating-promises
-            activityService.handleForceClockout();
+            activityService.handleForceClockout('upload-screenshot');
             return;
           }
 

@@ -137,17 +137,48 @@ class NetworkService {
 
       // Sync unsynced logs
       console.log('[Sync] Syncing unsynced activity logs...');
-      await apiService.syncUnsyncedLogs(auth.token, auth.user.workspace_id);
+      const logsForceClockout = await apiService.syncUnsyncedLogs(
+        auth.token,
+        auth.user.workspace_id,
+      );
+
+      if (logsForceClockout) {
+        // NOTE: deliberately does NOT clock the user out. See the comment
+        // before the screenshot sync below.
+        console.warn(
+          '[Sync] FORCE_CLOCKOUT while syncing backlog logs — backlog paused, live session untouched',
+        );
+      }
 
       // Recalculate break time from newly synced logs
       await activityService.recalculateBreakTime();
 
-      // Sync unsynced screenshots
+      // Sync unsynced screenshots. This deliberately runs even when the log
+      // sync above reported a force-clockout: returning early here meant a
+      // backlog of screenshots captured offline could never drain, because
+      // every sync cycle bailed out before reaching this point.
       console.log('[Sync] Syncing unsynced screenshots...');
-      await apiService.syncUnsyncedScreenshots(
+      const screenshotsForceClockout = await apiService.syncUnsyncedScreenshots(
         auth.token,
         auth.user.workspace_id,
       );
+
+      // A FORCE_CLOCKOUT here concerns a QUEUED, HISTORICAL item — a punch or
+      // screenshot captured minutes or hours ago. The server rejects it because
+      // the user was clocked out *at that item's timestamp*, which says nothing
+      // about the session running right now. Acting on it clocked users out
+      // seconds after a fresh clock-in, because a stale screenshot from an
+      // earlier clocked-out period was still sitting in the backlog.
+      //
+      // So the sync path never terminates the live session. A genuine admin
+      // force-clockout is still caught within one screenshot interval by the
+      // live paths (logActivity and captureAndUpload), which submit
+      // current-timestamped items and therefore reflect the user's real state.
+      if (screenshotsForceClockout) {
+        console.warn(
+          '[Sync] FORCE_CLOCKOUT while syncing backlog screenshots — backlog paused, live session untouched',
+        );
+      }
 
       const now = new Date();
 

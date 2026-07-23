@@ -17,6 +17,7 @@ import {
   powerMonitor,
   desktopCapturer,
   dialog,
+  systemPreferences,
 } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
@@ -29,13 +30,27 @@ import { resolveHtmlPath } from './util';
 
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('no-sandbox');
+
+  // Under Wayland, screen capture goes through the xdg-desktop-portal instead
+  // of X11, which a background capture loop cannot drive unattended. Flagged
+  // here so blank screenshots on such a session are diagnosable from the log.
+  if (process.env.XDG_SESSION_TYPE === 'wayland') {
+    console.warn(
+      '[DEBUG] Main process: Wayland session detected — screen capture requires portal approval and may be unavailable. An X11/Xorg session is recommended.',
+    );
+  }
 }
 
 class AppUpdater {
   constructor() {
     log.transports.file.level = 'info';
     autoUpdater.logger = log;
-    autoUpdater.checkForUpdatesAndNotify();
+    // Unpackaged runs have no app-update.yml, and AppImage is the only Linux
+    // target that can self-update — a .deb install must go through apt. Either
+    // way the rejection is informational, so it is logged rather than thrown.
+    autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+      log.info('Update check skipped:', error?.message || error);
+    });
   }
 }
 
@@ -44,6 +59,10 @@ let isAppQuitting = false;
 let isClockoutInitiated = false;
 let isClockoutComplete = false;
 
+// Must stay in sync with formatApiTimestamp() in
+// src/renderer/utils/timeUtils.ts — the shutdown clock-out below is a real
+// punch. Currently emits the legacy naive format; see API_TIMESTAMP_FORMAT
+// there for why ISO-8601 is temporarily reverted.
 function getLocalTimestamp(timezone: string = 'Asia/Kolkata'): string {
   const now = new Date();
   const options = {
@@ -301,10 +320,73 @@ ipcMain.handle('delete-file', async (_, filePath) => {
   }
 });
 
+let hasPromptedForScreenAccess = false;
+
+/**
+ * macOS gates screen capture behind the Screen Recording TCC permission. Without
+ * it desktopCapturer still "succeeds" but hands back a blank desktop image, so
+ * check before capturing and point the user at System Settings once.
+ * Returns false when capture should be skipped this cycle.
+ */
+function ensureScreenCaptureAccess(): boolean {
+  if (process.platform !== 'darwin') {
+    return true;
+  }
+
+  const status = systemPreferences.getMediaAccessStatus('screen');
+  if (status === 'granted') {
+    return true;
+  }
+
+  // 'not-determined' means the OS has never asked. Letting the capture run is
+  // what triggers the system prompt, so do not block it.
+  if (status === 'not-determined') {
+    console.log(
+      '[DEBUG] Main process: Screen recording permission not yet determined, capture will trigger the macOS prompt',
+    );
+    return true;
+  }
+
+  console.warn(
+    `[DEBUG] Main process: Screen recording permission is "${status}" — screenshots will be blank`,
+  );
+
+  if (!hasPromptedForScreenAccess) {
+    hasPromptedForScreenAccess = true;
+    dialog
+      .showMessageBox({
+        type: 'warning',
+        buttons: ['Open System Settings', 'Later'],
+        defaultId: 0,
+        title: 'Screen Recording Permission Required',
+        message: 'NS Ventures needs permission to capture your screen.',
+        detail:
+          'Enable NS Ventures under Privacy & Security → Screen Recording, then restart the app. Until then, screenshots cannot be captured.',
+      })
+      .then(({ response }) => {
+        if (response === 0) {
+          shell.openExternal(
+            'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+          );
+        }
+        return null;
+      })
+      .catch(console.error);
+  }
+
+  return false;
+}
+
 // Handle screenshot request
 ipcMain.on('take-screenshot', async (event) => {
   try {
     console.log('[DEBUG] Main process: Starting screenshot capture');
+
+    if (!ensureScreenCaptureAccess()) {
+      event.reply('screenshot-taken', '');
+      return;
+    }
+
     // Get all available sources
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
@@ -361,29 +443,65 @@ ipcMain.on('take-screenshot', async (event) => {
   }
 });
 
+/**
+ * Login-item support differs per platform (and is unavailable in some Linux
+ * desktop environments), so every call is guarded — a failure here must never
+ * take down window creation.
+ */
+function isAutoLaunchEnabled(): boolean {
+  try {
+    return app.getLoginItemSettings().openAtLogin;
+  } catch (error) {
+    console.error(
+      '[DEBUG] Main process: Unable to read login item settings:',
+      error,
+    );
+    return false;
+  }
+}
+
+function setAutoLaunch(enable: boolean): boolean {
+  try {
+    const settings: Parameters<typeof app.setLoginItemSettings>[0] = {
+      openAtLogin: enable,
+      // On macOS, this opens the app in the background
+      openAsHidden: false,
+    };
+
+    // An AppImage runs from a temporary mountpoint, so process.execPath is not
+    // a stable launcher to autostart. $APPIMAGE is the file the user keeps.
+    if (process.platform === 'linux' && process.env.APPIMAGE) {
+      settings.path = process.env.APPIMAGE;
+      settings.args = [];
+    }
+
+    app.setLoginItemSettings(settings);
+    return isAutoLaunchEnabled();
+  } catch (error) {
+    console.error(
+      '[DEBUG] Main process: Unable to update login item settings:',
+      error,
+    );
+    return false;
+  }
+}
+
 // Check if app is set as a startup item
 ipcMain.handle('check-startup-status', () => {
-  const settings = app.getLoginItemSettings();
-  return settings.openAtLogin;
+  return isAutoLaunchEnabled();
 });
 
 // Set app as a startup item
 ipcMain.handle('set-startup-status', (_, enable) => {
-  app.setLoginItemSettings({
-    openAtLogin: enable,
-    // On macOS, this opens the app in the background
-    openAsHidden: false,
-  });
-  return app.getLoginItemSettings().openAtLogin;
+  return setAutoLaunch(enable);
 });
 
 // Show startup prompt dialog
 ipcMain.handle('show-startup-prompt', async () => {
   if (!mainWindow) return false;
 
-  const settings = app.getLoginItemSettings();
   // If already set to open at login, don't show the prompt
-  if (settings.openAtLogin) return true;
+  if (isAutoLaunchEnabled()) return true;
 
   const { response } = await dialog.showMessageBox(mainWindow, {
     type: 'question',
@@ -398,10 +516,7 @@ ipcMain.handle('show-startup-prompt', async () => {
   const enableStartup = response === 0; // 'Yes' button was clicked
 
   if (enableStartup) {
-    app.setLoginItemSettings({
-      openAtLogin: true,
-      openAsHidden: false,
-    });
+    setAutoLaunch(true);
   }
 
   return enableStartup;
@@ -486,18 +601,17 @@ const createWindow = async () => {
     } else {
       mainWindow.show();
 
-      // Automatically enable startup on login (for both Mac and Windows)
+      // Automatically enable startup on login (Windows, macOS and Linux)
       if (process.env.NODE_ENV === 'production') {
-        const settings = app.getLoginItemSettings();
-
         // If not already set, enable it automatically
-        if (!settings.openAtLogin) {
+        if (!isAutoLaunchEnabled()) {
           console.log('Enabling auto-start on login...');
-          app.setLoginItemSettings({
-            openAtLogin: true,
-            openAsHidden: false, // Open normally, not hidden
-          });
-          console.log('Auto-start enabled successfully');
+          const enabled = setAutoLaunch(true);
+          console.log(
+            enabled
+              ? 'Auto-start enabled successfully'
+              : 'Auto-start is not available on this platform',
+          );
         }
       }
     }
@@ -635,8 +749,10 @@ const createWindow = async () => {
   });
 
   // Remove this if your app does not use auto updates
-  // eslint-disable-next-line
-  new AppUpdater();
+  if (app.isPackaged) {
+    // eslint-disable-next-line
+    new AppUpdater();
+  }
 };
 
 app.on('before-quit', (event) => {

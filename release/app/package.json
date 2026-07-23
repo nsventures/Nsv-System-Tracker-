@@ -1,12 +1,13 @@
 {
-  "name": "electron-react-boilerplate",
-  "version": "4.6.0",
-  "description": "A foundation for scalable desktop apps",
+  "name": "ns-ventures",
+  "productName": "NS Ventures",
+  "version": "1.0.0",
+  "description": "Employee time tracking and productivity monitoring",
   "license": "MIT",
   "author": {
-    "name": "Electron React Boilerplate Maintainers",
-    "email": "electronreactboilerplate@gmail.com",
-    "url": "https://github.com/electron-react-boilerplate"
+    "name": "NS Ventures",
+    "email": "support@nsventures.example.com",
+    "url": "https://github.com/nsventures"
   },
   "main": "./dist/main/main.js",
   "scripts": {

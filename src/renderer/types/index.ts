@@ -52,6 +52,7 @@ export interface ActivityLog {
     | 'manual-processing-start'
     | 'manual-processing-stop';
   timestamp: string;
+  reason?: string; // Optional reason for manual-time actions; persisted so it survives offline sync
   synced: boolean; // Flag to track if the log has been synced with the server
 }
 
@@ -62,6 +63,7 @@ export interface ApiResponse<T> {
   data?: T;
   token?: string;
   code?: string;
+  status?: number; // HTTP status, set on rejections so callers can tell terminal (4xx) from retryable (5xx/network)
 }
 
 // Login request type
