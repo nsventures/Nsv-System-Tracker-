@@ -266,6 +266,14 @@
         "StartupNotify": "true"
       }
     },
+    "deb": {
+      "fpm": [
+        "--conflicts",
+        "electron-react-boilerplate",
+        "--replaces",
+        "electron-react-boilerplate"
+      ]
+    },
     "directories": {
       "app": "release/app",
       "buildResources": "assets",
