@@ -70,6 +70,30 @@ let isAppQuitting = false;
 let isClockoutInitiated = false;
 let isClockoutComplete = false;
 
+// Set by the OS-level shutdown handler before it calls app.quit(), so the
+// generic before-quit path can tell a real system shutdown apart from an
+// ordinary quit. Cleared implicitly by process exit.
+let systemQuitSource: string | null = null;
+
+/**
+ * Human-readable reason recorded on the clock-out written when the app is
+ * terminated while the user is still clocked in. The previous code labelled
+ * every one of these "Gracefully clocked out on PC shutdown", which was
+ * misleading — an overnight OS update reboot or a log-off is not a shutdown.
+ */
+function describeClockoutTrigger(source: string): string {
+  switch (source) {
+    case 'query-session-end':
+    case 'session-end':
+      return 'Auto clock-out: system session ended (restart, log-off, or OS update)';
+    case 'system-shutdown':
+      return 'Auto clock-out: system was shutting down';
+    case 'before-quit':
+    default:
+      return 'Auto clock-out: application closed while still clocked in';
+  }
+}
+
 // Must stay in sync with formatApiTimestamp() in
 // src/renderer/utils/timeUtils.ts — the shutdown clock-out below is a real
 // punch. Currently emits the legacy naive format; see API_TIMESTAMP_FORMAT
@@ -91,7 +115,10 @@ function getLocalTimestamp(timezone: string = 'Asia/Kolkata'): string {
     .replace(/(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+):(\d+)/, '$3-$1-$2 $4:$5:$6');
 }
 
-function performDirectClockoutAsync(session: any): Promise<void> {
+function performDirectClockoutAsync(
+  session: any,
+  reason: string,
+): Promise<void> {
   return new Promise((resolve) => {
     try {
       const serverUrl =
@@ -107,7 +134,7 @@ function performDirectClockoutAsync(session: any): Promise<void> {
         user_id: session.userId,
         action: 'clock-out',
         timestamp: formattedDate,
-        reason: 'Gracefully clocked out on PC shutdown',
+        reason,
       });
 
       const parsedUrl = new URL(endpoint);
@@ -164,8 +191,15 @@ function performDirectClockoutAsync(session: any): Promise<void> {
 }
 
 function handleGracefulShutdown(event: any, source: string): void {
-  console.log(
-    `[DEBUG] handleGracefulShutdown called from ${source}. isClockoutInitiated=${isClockoutInitiated}, isClockoutComplete=${isClockoutComplete}`,
+  // A real OS shutdown routes through app.quit() → before-quit, which would
+  // otherwise look like a plain quit; systemQuitSource preserves the specific
+  // trigger so the recorded reason is accurate.
+  const effectiveSource = systemQuitSource || source;
+  // electron-log persists to userData/logs/main.log; console.log does not, and
+  // an overnight OS-triggered quit has no terminal attached — so log here to
+  // make the cause of these clock-outs provable after the fact.
+  log.info(
+    `[lifecycle] handleGracefulShutdown from "${source}" (effective: "${effectiveSource}"). initiated=${isClockoutInitiated}, complete=${isClockoutComplete}`,
   );
   isAppQuitting = true;
 
@@ -187,17 +221,15 @@ function handleGracefulShutdown(event: any, source: string): void {
     try {
       const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
       if (session && session.isClockedIn && session.token && session.userId) {
-        console.log(
-          `[DEBUG] Graceful shutdown (${source}): User is clocked in. Writing session.json synchronously...`,
+        const clockoutReason = describeClockoutTrigger(effectiveSource);
+        log.info(
+          `[lifecycle] User still clocked in at ${effectiveSource}; clocking out. Reason: "${clockoutReason}"`,
         );
         const lastActiveTime = getLocalTimestamp(session.timezone);
         session.isClockedIn = false;
         session.lastActiveTime = lastActiveTime;
         fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2));
 
-        console.log(
-          `[DEBUG] Graceful shutdown (${source}): Performing direct async clockout...`,
-        );
         isClockoutInitiated = true;
 
         let isDone = false;
@@ -214,7 +246,7 @@ function handleGracefulShutdown(event: any, source: string): void {
         // Fallback safety timeout
         setTimeout(finish, 4500);
 
-        performDirectClockoutAsync(session)
+        performDirectClockoutAsync(session, clockoutReason)
           .then(finish)
           .catch((err) => {
             console.error(`[DEBUG] Async clockout promise rejection:`, err);
@@ -781,9 +813,8 @@ const createWindow = async () => {
 
   // Handle Windows session end / shutdown events
   mainWindow.on('session-end', () => {
-    console.log(
-      '[DEBUG] Main process: session-end event received on mainWindow.',
-    );
+    log.info('[lifecycle] session-end received on mainWindow');
+    systemQuitSource = 'session-end';
     isAppQuitting = true;
     app.quit();
   });
@@ -889,9 +920,10 @@ const createWindow = async () => {
   });
 
   powerMonitor.on('shutdown', () => {
-    console.log(
-      '[DEBUG] Main process: System shutting down. Calling app.quit() to trigger graceful clockout...',
+    log.info(
+      '[lifecycle] powerMonitor shutdown event — system is shutting down',
     );
+    systemQuitSource = 'system-shutdown';
     app.quit();
   });
 
