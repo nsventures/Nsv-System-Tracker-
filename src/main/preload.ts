@@ -20,7 +20,9 @@ export type Channels =
   | 'system-suspend-before-715'
   | 'clock-out-complete'
   | 'save-session'
-  | 'get-session';
+  | 'get-session'
+  | 'get-display-env'
+  | 'save-screenshot-buffer';
 
 const electronHandler = {
   ipcRenderer: {
@@ -94,6 +96,20 @@ const electronHandler = {
     getSession: () => {
       return ipcRenderer.invoke('get-session');
     },
+
+    // Report the platform and whether this is a Wayland session, so the
+    // screenshot service can pick its capture strategy.
+    getDisplayEnv: (): Promise<{ platform: string; isWayland: boolean }> => {
+      return ipcRenderer.invoke('get-display-env');
+    },
+
+    // Persist a base64 PNG captured in the renderer (Wayland getDisplayMedia
+    // path). Returns the saved file path so the upload flow is unchanged.
+    saveScreenshotBuffer: (
+      base64Data: string,
+    ): Promise<{ error: boolean; message: string; filePath: string }> => {
+      return ipcRenderer.invoke('save-screenshot-buffer', base64Data);
+    },
   },
 };
 
@@ -120,6 +136,9 @@ export interface ElectronHandler {
     setStartupEnabled(enable: boolean): Promise<boolean>;
     showStartupPrompt(): Promise<boolean>;
     getSession(): Promise<any>;
+    getDisplayEnv(): Promise<{ platform: string; isWayland: boolean }>;
+    saveScreenshotBuffer(
+      base64Data: string,
+    ): Promise<{ error: boolean; message: string; filePath: string }>;
   };
 }
-

@@ -18,6 +18,7 @@ import {
   desktopCapturer,
   dialog,
   systemPreferences,
+  session as electronSession,
 } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
@@ -28,15 +29,25 @@ import { URL } from 'url';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
 
-if (process.platform === 'linux') {
+const isLinux = process.platform === 'linux';
+const isWaylandSession =
+  isLinux &&
+  (process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY);
+
+if (isLinux) {
   app.commandLine.appendSwitch('no-sandbox');
 
-  // Under Wayland, screen capture goes through the xdg-desktop-portal instead
-  // of X11, which a background capture loop cannot drive unattended. Flagged
-  // here so blank screenshots on such a session are diagnosable from the log.
-  if (process.env.XDG_SESSION_TYPE === 'wayland') {
-    console.warn(
-      '[DEBUG] Main process: Wayland session detected — screen capture requires portal approval and may be unavailable. An X11/Xorg session is recommended.',
+  if (isWaylandSession) {
+    // On Wayland, desktopCapturer.getSources() opens a NEW xdg-desktop-portal
+    // ScreenCast session on every call, and the compositor asks the user to
+    // consent to each one — so a 5-minute capture loop prompts endlessly.
+    // The renderer instead holds a single getDisplayMedia() stream (see
+    // screenshot.ts): one consent for the whole session, and the portal's own
+    // picker can offer "remember" for persistence across restarts. PipeWire is
+    // the transport that makes that stream work under Wayland.
+    app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+    console.log(
+      '[DEBUG] Main process: Wayland session detected — using persistent getDisplayMedia capture via PipeWire portal',
     );
   }
 }
@@ -443,6 +454,53 @@ ipcMain.on('take-screenshot', async (event) => {
   }
 });
 
+// Tells the renderer which capture strategy to use. On Wayland it holds a
+// single getDisplayMedia() stream instead of calling desktopCapturer per shot.
+ipcMain.handle('get-display-env', () => {
+  return {
+    platform: process.platform,
+    isWayland: isWaylandSession,
+  };
+});
+
+// Persist a PNG captured in the renderer (the Wayland getDisplayMedia path
+// produces the image as base64 there, not on disk). Mirrors the naming and
+// location of the desktopCapturer path so the upload flow is identical.
+ipcMain.handle('save-screenshot-buffer', async (_, base64Data: string) => {
+  try {
+    if (!base64Data) {
+      return { error: true, message: 'Empty screenshot buffer', filePath: '' };
+    }
+
+    const screenshotPath = path.join(app.getPath('userData'), 'screenshots');
+    if (!fs.existsSync(screenshotPath)) {
+      fs.mkdirSync(screenshotPath, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/:/g, '-');
+    const filePath = path.join(screenshotPath, `screenshot-${timestamp}.png`);
+    const buffer = Buffer.from(base64Data, 'base64');
+    fs.writeFileSync(filePath, buffer);
+
+    console.log(
+      `[DEBUG] Main process: Saved renderer screenshot (${buffer.length} bytes) to ${filePath}`,
+    );
+
+    if (buffer.length === 0) {
+      console.error(
+        '[DEBUG] Main process: Renderer screenshot buffer was empty',
+      );
+    }
+
+    return { error: false, message: 'Screenshot saved', filePath };
+  } catch (error) {
+    console.error(
+      `[DEBUG] Main process: Error saving renderer screenshot: ${error}`,
+    );
+    return { error: true, message: `${error}`, filePath: '' };
+  }
+});
+
 /**
  * Login-item support differs per platform (and is unavailable in some Linux
  * desktop environments), so every call is guarded — a failure here must never
@@ -594,6 +652,42 @@ const createWindow = async () => {
         : path.join(__dirname, '../../.erb/dll/preload.js'),
     },
   });
+
+  // On Wayland the renderer captures via navigator.mediaDevices.getDisplayMedia,
+  // which routes through this handler. Prefer the system (portal) picker so the
+  // compositor can offer "remember this choice" for cross-restart persistence;
+  // fall back to auto-selecting the primary screen if the picker is unavailable,
+  // so capture still works headlessly rather than hanging on a dialog.
+  if (isWaylandSession) {
+    electronSession.defaultSession.setDisplayMediaRequestHandler(
+      (_request, callback) => {
+        desktopCapturer
+          .getSources({ types: ['screen'] })
+          .then((sources) => {
+            if (sources.length > 0) {
+              callback({ video: sources[0] });
+            } else {
+              // Electron's types require a source; there is no clean "deny"
+              // here, so hand back an empty object and let getDisplayMedia
+              // reject in the renderer.
+              callback({});
+            }
+            return null;
+          })
+          .catch((error) => {
+            console.error(
+              '[DEBUG] Main process: Display media source selection failed:',
+              error,
+            );
+            callback({});
+          });
+      },
+      // useSystemPicker lets the portal present its own dialog (with a persist
+      // option) instead of us silently auto-picking; Electron ignores the
+      // handler above when the picker is supported.
+      { useSystemPicker: true },
+    );
+  }
 
   const startUrl = resolveHtmlPath('index.html');
   console.log(`[DEBUG] Main process: Loading renderer from ${startUrl}`);

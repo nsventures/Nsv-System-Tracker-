@@ -17,6 +17,15 @@ class ScreenshotService {
 
   private workspaceId: number | null = null;
 
+  // Wayland capture state. On Wayland the desktopCapturer path prompts for
+  // portal consent on every call, so we hold ONE getDisplayMedia stream for the
+  // whole session and grab still frames from it instead.
+  private useDisplayMedia: boolean = false;
+
+  private captureStream: MediaStream | null = null;
+
+  private captureVideo: HTMLVideoElement | null = null;
+
   // Initialize the screenshot service
   public async initialize(): Promise<void> {
     try {
@@ -35,6 +44,26 @@ class ScreenshotService {
       console.log(
         '[DEBUG] Screenshot service authenticated with token and workspace ID',
       );
+
+      // Decide the capture strategy once, from the session type reported by the
+      // main process.
+      try {
+        const env = await window.electron.system.getDisplayEnv();
+        this.useDisplayMedia = env.isWayland;
+        console.log(
+          `[DEBUG] Screenshot capture strategy: ${
+            this.useDisplayMedia
+              ? 'getDisplayMedia stream (Wayland)'
+              : 'desktopCapturer (default)'
+          }`,
+        );
+      } catch (envError) {
+        console.error(
+          '[DEBUG] Could not determine display env, defaulting to desktopCapturer:',
+          envError,
+        );
+        this.useDisplayMedia = false;
+      }
 
       // Get config
       const config = await databaseService.getConfig();
@@ -136,9 +165,12 @@ class ScreenshotService {
         return;
       }
 
-      // Take a screenshot using the electron API
-      console.log('[DEBUG] Calling electron API to take screenshot');
-      const screenshotPath = await window.electron.system.takeScreenshot();
+      // Take a screenshot. On Wayland this grabs a frame from the held
+      // getDisplayMedia stream; elsewhere it goes through desktopCapturer.
+      console.log('[DEBUG] Calling capture path to take screenshot');
+      const screenshotPath = this.useDisplayMedia
+        ? await this.captureViaDisplayMedia()
+        : await window.electron.system.takeScreenshot();
       console.log(`[DEBUG] Screenshot path received: ${screenshotPath}`);
 
       if (!screenshotPath) {
@@ -235,6 +267,124 @@ class ScreenshotService {
     } catch (error) {
       console.error('[DEBUG] Error capturing and uploading screenshot:', error);
     }
+  }
+
+  /**
+   * Ensure a live getDisplayMedia stream exists. The first call triggers the
+   * portal's consent dialog once; the stream is then reused for every
+   * subsequent capture so the user is not re-prompted each interval.
+   */
+  private async ensureCaptureStream(): Promise<boolean> {
+    const existingTrack = this.captureStream?.getVideoTracks()[0];
+    if (existingTrack && existingTrack.readyState === 'live') {
+      return true;
+    }
+
+    // Any half-dead stream from a previous attempt is cleared before retrying.
+    this.releaseCaptureStream();
+
+    try {
+      console.log('[DEBUG] Acquiring getDisplayMedia stream (Wayland)');
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 1, max: 5 },
+        },
+        audio: false,
+      });
+
+      const video = document.createElement('video');
+      video.muted = true;
+      video.srcObject = stream;
+      await video.play();
+
+      // Give the first frame a moment to arrive; videoWidth is 0 until then.
+      if (video.videoWidth === 0) {
+        await new Promise<void>((resolve) => {
+          const done = () => resolve();
+          video.addEventListener('loadeddata', done, { once: true });
+          setTimeout(done, 1000);
+        });
+      }
+
+      this.captureStream = stream;
+      this.captureVideo = video;
+
+      // If the user stops sharing (or a monitor is unplugged), drop the stream
+      // so the next capture re-acquires — which will re-prompt, unavoidably.
+      const track = stream.getVideoTracks()[0];
+      track.addEventListener('ended', () => {
+        console.log('[DEBUG] getDisplayMedia track ended, releasing stream');
+        this.releaseCaptureStream();
+      });
+
+      console.log(
+        `[DEBUG] getDisplayMedia stream ready (${video.videoWidth}x${video.videoHeight})`,
+      );
+      return true;
+    } catch (error) {
+      console.error('[DEBUG] Failed to acquire getDisplayMedia stream:', error);
+      this.releaseCaptureStream();
+      return false;
+    }
+  }
+
+  // Tear down the held stream and its video element.
+  private releaseCaptureStream(): void {
+    if (this.captureStream) {
+      this.captureStream.getTracks().forEach((track) => track.stop());
+      this.captureStream = null;
+    }
+    if (this.captureVideo) {
+      this.captureVideo.srcObject = null;
+      this.captureVideo = null;
+    }
+  }
+
+  /**
+   * Grab a single frame from the held stream, encode it as PNG, and write it to
+   * disk via the main process. Returns the saved file path, or '' on failure.
+   */
+  private async captureViaDisplayMedia(): Promise<string> {
+    const ready = await this.ensureCaptureStream();
+    if (!ready || !this.captureVideo) {
+      return '';
+    }
+
+    const video = this.captureVideo;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (width === 0 || height === 0) {
+      console.error('[DEBUG] Capture video has no dimensions yet');
+      return '';
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      console.error('[DEBUG] Could not get 2D canvas context');
+      return '';
+    }
+    ctx.drawImage(video, 0, 0, width, height);
+
+    const dataUrl = canvas.toDataURL('image/png');
+    const base64 = dataUrl.split(',')[1] || '';
+    if (!base64) {
+      console.error('[DEBUG] Canvas produced an empty PNG');
+      return '';
+    }
+
+    const result = await window.electron.system.saveScreenshotBuffer(base64);
+    if (result.error || !result.filePath) {
+      console.error(
+        `[DEBUG] Failed to save renderer screenshot: ${result.message}`,
+      );
+      return '';
+    }
+    return result.filePath;
   }
 }
 
