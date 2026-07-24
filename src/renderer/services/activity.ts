@@ -361,32 +361,14 @@ class ActivityService {
           return;
         }
 
-        // Check for late night idle auto-clockout: after 8:00 PM IST and idle >= 30 minutes
-        const nowTime = new Date();
-        const istTimeStr = nowTime.toLocaleString('en-US', {
-          timeZone: 'Asia/Kolkata',
-        });
-        const istDate = new Date(istTimeStr);
-        const istHour = istDate.getHours();
-
-        const isAfter8PmIst = istHour >= 20 || istHour < 6;
-        const THIRTY_MIN_MS = 30 * 60 * 1000;
-
-        if (isAfter8PmIst && idleTimeMs >= THIRTY_MIN_MS) {
-          console.log(
-            `[Auto-Clockout] System idle for ${
-              idleTimeMs / 60000
-            } minutes after 8:00 PM IST. Triggering clockout...`,
-          );
-          await this.clockOut();
-          this.showNotification(
-            'Auto Clock-Out',
-            'You have been automatically clocked out due to 30 minutes of inactivity after 8:00 PM IST.',
-          );
-          window.dispatchEvent(new CustomEvent('force-clockout'));
-          return;
-        }
-
+        // NOTE: the idle auto-clock-out was removed. It fired after 30 minutes
+        // idle inside a window hardcoded to 8 PM–6 AM Asia/Kolkata, while the
+        // app records time in each machine's own timezone. On any machine
+        // outside India that window fell across the working day, so an ordinary
+        // idle stretch (lunch, a meeting) silently clocked the user out — and
+        // getSystemIdleTime() over-reports idle on some platforms (Wayland),
+        // tripping it even while the user was active. Idle is now only logged,
+        // never acted on; users clock out themselves or an admin force-clocks.
         if (idleTimeMs >= this.idleThreshold) {
           if (!this.isIdle) {
             this.isIdle = true;
@@ -674,6 +656,13 @@ class ActivityService {
 
   // Manually start manual time tracking
   public async startManualTime() {
+    // DIAGNOSTIC: nothing in this codebase should call startManualTime except
+    // the dashboard button. Log the call stack so that if manual time appears
+    // to start on its own, the captured logs show exactly what invoked it.
+    console.log(
+      `[DIAG] startManualTime called. Stack:\n${new Error().stack || '(no stack)'}`,
+    );
+
     // Ensure user is clocked in before starting manual time
     const clockedIn = await this.isUserClockedIn();
     if (!clockedIn) {

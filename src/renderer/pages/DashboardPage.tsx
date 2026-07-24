@@ -73,6 +73,13 @@ function DashboardPage(): React.ReactElement | null {
 
   // Handle manual time start/stop
   const handleManualTime = async () => {
+    // DIAGNOSTIC: confirms a real button click reached this handler, so the
+    // logs distinguish a user action from manual time appearing some other way.
+    // eslint-disable-next-line no-console
+    console.log(
+      '[DIAG] Manual Time button clicked, isOnManualTime=',
+      isOnManualTime,
+    );
     if (isOnManualTime) {
       setIsReasonModalOpen(true);
     } else {
