@@ -859,27 +859,30 @@ const createWindow = async () => {
     console.log('[DEBUG] Main process: System entering suspend/sleep mode');
     if (!mainWindow) return;
 
-    // Get current hour and minute in Indian Standard Time (IST)
+    // Use the machine's LOCAL time, matching how the app records everything
+    // (whiteLabelConfig.timezone.default resolves to the system timezone). This
+    // was previously hardcoded to Asia/Kolkata, so on a machine outside India
+    // the "evening" cutoff fell across the working day and a lunchtime suspend
+    // clocked the user out. getHours()/getMinutes() are already local.
     const now = new Date();
-    const istTimeStr = now.toLocaleString('en-US', {
-      timeZone: 'Asia/Kolkata',
-    });
-    const istDate = new Date(istTimeStr);
-    const istHour = istDate.getHours();
-    const istMinute = istDate.getMinutes();
+    const localHour = now.getHours();
+    const localMinute = now.getMinutes();
 
-    // Check if it is after 7:15 PM IST (19:15)
-    const isAfter715PmIst =
-      istHour > 19 || (istHour === 19 && istMinute >= 15) || istHour < 6;
+    // After 7:15 PM local (or before 6 AM), suspend means the day is over →
+    // clock out. Earlier in the day, a suspend is just a break → mark idle.
+    const isAfterEveningCutoff =
+      localHour > 19 ||
+      (localHour === 19 && localMinute >= 15) ||
+      localHour < 6;
 
-    if (isAfter715PmIst) {
+    if (isAfterEveningCutoff) {
       console.log(
-        '[DEBUG] Main process: Suspend event after 7:15 PM IST. Triggering clock-out...',
+        '[DEBUG] Main process: Suspend event after 7:15 PM local time. Triggering clock-out...',
       );
       mainWindow.webContents.send('clock-out-and-exit');
     } else {
       console.log(
-        '[DEBUG] Main process: Suspend event before 7:15 PM IST. Marking user as idle...',
+        '[DEBUG] Main process: Suspend event before 7:15 PM local time. Marking user as idle...',
       );
       mainWindow.webContents.send('system-suspend-before-715');
     }
