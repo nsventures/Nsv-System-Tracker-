@@ -1,5 +1,3 @@
-
-
 export const whiteLabelConfig = {
   // Application Information
   app: {

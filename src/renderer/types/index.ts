@@ -35,7 +35,10 @@ export interface Config {
   manualTimeApprover: string[];
   totalBreakTime?: number; // Stores the total break time used (persisted between app restarts)
   lastBreakResetDate?: string; // Stores the ISO date string of the last break reset (YYYY-MM-DD)
-  userBreakTimes?: Record<number, { totalBreakTime: number; lastBreakResetDate: string }>;
+  userBreakTimes?: Record<
+    number,
+    { totalBreakTime: number; lastBreakResetDate: string }
+  >;
 }
 
 // Activity log type for tracking employee activities

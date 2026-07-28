@@ -18,10 +18,6 @@ try {
   );
   const indexEjsPath = path.resolve(__dirname, '../../src/renderer/index.ejs');
   const packageJsonPath = path.resolve(__dirname, '../../package.json');
-  const buildConfigPath = path.resolve(
-    __dirname,
-    '../../dist/main/whiteLabel.config.js',
-  );
 
   console.log('Applying white label configuration...');
 

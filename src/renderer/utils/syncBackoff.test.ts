@@ -50,8 +50,14 @@ describe('isInBackoff', () => {
   });
 
   it('respects the 30-minute cap at high attempt counts', () => {
-    const justInside = { attempts: 40, lastAttemptAt: now - (30 * 60 * 1000 - 1) };
-    const justOutside = { attempts: 40, lastAttemptAt: now - (30 * 60 * 1000 + 1) };
+    const justInside = {
+      attempts: 40,
+      lastAttemptAt: now - (30 * 60 * 1000 - 1),
+    };
+    const justOutside = {
+      attempts: 40,
+      lastAttemptAt: now - (30 * 60 * 1000 + 1),
+    };
     expect(isInBackoff(justInside, now)).toBe(true);
     expect(isInBackoff(justOutside, now)).toBe(false);
   });
