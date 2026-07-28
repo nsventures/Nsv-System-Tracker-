@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth, useNetwork } from '../context';
 import { LoginRequest } from '../types';
@@ -45,13 +45,6 @@ function LoginPage() {
     }
   };
 
-  // Show reset option after multiple login failures
-  useEffect(() => {
-    if (error && error.includes('Invalid email or password')) {
-      setShowResetOption(true);
-    }
-  }, [error]);
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -75,6 +68,10 @@ function LoginPage() {
         setError(
           result.message || 'Invalid email or password. Please try again.',
         );
+        // Offer the reset option on any failed login, regardless of the exact
+        // server message — the previous string match broke when the backend
+        // changed its wrong-password wording.
+        setShowResetOption(true);
       } else {
         // Redirect to dashboard after successful login
         navigate('/');
