@@ -1,0 +1,52 @@
+name: Release
+
+# Cutting a release: bump the version in release/app/package.json, commit, then
+#   git tag v1.0.1 && git push origin v1.0.1
+# That tag triggers this workflow, which builds all three platforms and uploads
+# them — together with the latest*.yml update metadata electron-updater reads —
+# to a GitHub Release. By default electron-builder creates the release as a
+# DRAFT: review it on the Releases page, then click "Publish" to hand the update
+# to the fleet. (Set publish.releaseType to "release" in package.json to skip
+# that gate and publish automatically.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # allows a manual re-run from the Actions UI
+
+jobs:
+  release:
+    name: Release on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # One platform failing must not abandon the others' uploads.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout Git Repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build renderer and main
+        run: npm run build
+
+      - name: Build and publish to GitHub Release
+        env:
+          # macOS is published unsigned (no Developer ID cert), so disable
+          # signing-identity auto-discovery to keep the build from failing.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          # Token electron-builder uses to create/upload the GitHub Release.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --publish always

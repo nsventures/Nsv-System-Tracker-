@@ -242,6 +242,35 @@ export async function markActivityLogAsSynced(id: number): Promise<void> {
   }
 }
 
+// Record one more sync attempt against a log and return the running count, so
+// the sync loop can back off and eventually dead-letter a stuck event.
+export async function bumpActivityLogAttempts(id: number): Promise<number> {
+  const db = await getDB();
+  const log = await db.get('activityLogs', id);
+  if (!log) return 0;
+  const attempts = ((log as any).attempts || 0) + 1;
+  (log as any).attempts = attempts;
+  (log as any).lastAttemptAt = Date.now();
+  await db.put('activityLogs', log);
+  return attempts;
+}
+
+// Retire a log that has failed too many times: exclude it from the queue
+// (synced = 1) but keep it, flagged, for history and diagnosis.
+export async function deadLetterActivityLog(
+  id: number,
+  error: string,
+): Promise<void> {
+  const db = await getDB();
+  const log = await db.get('activityLogs', id);
+  if (!log) return;
+  // @ts-ignore
+  log.synced = 1;
+  (log as any).deadLettered = true;
+  (log as any).syncError = error;
+  await db.put('activityLogs', log);
+}
+
 export async function deleteActivityLog(id: number): Promise<void> {
   const db = await getDB();
   await db.delete('activityLogs', id);
@@ -336,6 +365,31 @@ export async function markScreenshotAsSynced(id: number): Promise<void> {
   }
 }
 
+export async function bumpScreenshotAttempts(id: number): Promise<number> {
+  const db = await getDB();
+  const screenshot = await db.get('screenshots', id);
+  if (!screenshot) return 0;
+  const attempts = ((screenshot as any).attempts || 0) + 1;
+  (screenshot as any).attempts = attempts;
+  (screenshot as any).lastAttemptAt = Date.now();
+  await db.put('screenshots', screenshot);
+  return attempts;
+}
+
+export async function deadLetterScreenshot(
+  id: number,
+  error: string,
+): Promise<void> {
+  const db = await getDB();
+  const screenshot = await db.get('screenshots', id);
+  if (!screenshot) return;
+  // @ts-ignore
+  screenshot.synced = 1;
+  (screenshot as any).deadLettered = true;
+  (screenshot as any).syncError = error;
+  await db.put('screenshots', screenshot);
+}
+
 export async function deleteScreenshot(id: number): Promise<void> {
   const db = await getDB();
   await db.delete('screenshots', id);
@@ -357,12 +411,16 @@ const databaseService = {
   getActivityLogs,
   getUnsyncedActivityLogs,
   markActivityLogAsSynced,
+  bumpActivityLogAttempts,
+  deadLetterActivityLog,
   deleteActivityLog,
   clearActivityLogs,
   saveScreenshot,
   getScreenshots,
   getUnsyncedScreenshots,
   markScreenshotAsSynced,
+  bumpScreenshotAttempts,
+  deadLetterScreenshot,
   deleteScreenshot,
   clearScreenshots,
   resetDatabase,

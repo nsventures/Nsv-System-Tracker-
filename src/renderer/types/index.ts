@@ -54,6 +54,11 @@ export interface ActivityLog {
   timestamp: string;
   reason?: string; // Optional reason for manual-time actions; persisted so it survives offline sync
   synced: boolean; // Flag to track if the log has been synced with the server
+  // Durable-queue bookkeeping (see api.ts sync + database.ts):
+  attempts?: number; // how many sync attempts this event has had
+  lastAttemptAt?: number; // epoch ms of the last attempt, for backoff
+  deadLettered?: boolean; // gave up after MAX attempts; retired from the queue but kept for history
+  syncError?: string; // last error seen, recorded when dead-lettered
 }
 
 // API response types
@@ -92,4 +97,9 @@ export interface Screenshot {
   filePath: string; // Path to the screenshot file
   timestamp: string; // When the screenshot was taken
   synced: boolean; // Flag to track if the screenshot has been synced with the server
+  // Durable-queue bookkeeping (see api.ts sync + database.ts):
+  attempts?: number;
+  lastAttemptAt?: number;
+  deadLettered?: boolean;
+  syncError?: string;
 }

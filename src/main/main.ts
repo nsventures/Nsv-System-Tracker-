@@ -25,6 +25,7 @@ import log from 'electron-log';
 import fs from 'fs';
 import http from 'http';
 import https from 'https';
+import crypto from 'crypto';
 import { URL } from 'url';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
@@ -52,16 +53,57 @@ if (isLinux) {
   }
 }
 
+// Persist logs to userData/logs/main.log with rotation, and capture crashes in
+// the main process so a field failure leaves a trace instead of vanishing.
+log.transports.file.level = 'info';
+log.transports.file.maxSize = 5 * 1024 * 1024; // rotate at 5 MB
+process.on('uncaughtException', (error) => {
+  log.error('[crash] Uncaught exception (main process):', error);
+});
+process.on('unhandledRejection', (reason) => {
+  log.error('[crash] Unhandled promise rejection (main process):', reason);
+});
+
+// Re-check for updates on this cadence. The tracker runs for days without
+// quitting, so a single check at startup would rarely catch a release; a
+// downloaded update still only installs on the next app quit/restart.
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 class AppUpdater {
   constructor() {
     log.transports.file.level = 'info';
     autoUpdater.logger = log;
-    // Unpackaged runs have no app-update.yml, and AppImage is the only Linux
-    // target that can self-update — a .deb install must go through apt. Either
-    // way the rejection is informational, so it is logged rather than thrown.
-    autoUpdater.checkForUpdatesAndNotify().catch((error) => {
-      log.info('Update check skipped:', error?.message || error);
+
+    // Surface the update lifecycle in main.log so a rollout is observable per
+    // machine (what version was offered, downloaded, or why it was skipped).
+    autoUpdater.on('checking-for-update', () => {
+      log.info('[updater] Checking for update…');
     });
+    autoUpdater.on('update-available', (info) => {
+      log.info(`[updater] Update available: ${info.version}`);
+    });
+    autoUpdater.on('update-not-available', () => {
+      log.info('[updater] No update available');
+    });
+    autoUpdater.on('update-downloaded', (info) => {
+      log.info(
+        `[updater] Update ${info.version} downloaded; installs on next quit/restart`,
+      );
+    });
+    autoUpdater.on('error', (error) => {
+      log.info(`[updater] Error: ${error?.message || error}`);
+    });
+
+    // A .deb install and unpackaged runs cannot self-update (no app-update.yml
+    // / apt owns the package), so the check rejects — informational, not fatal.
+    const check = () => {
+      autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+        log.info(`[updater] Update check skipped: ${error?.message || error}`);
+      });
+    };
+
+    check();
+    setInterval(check, UPDATE_CHECK_INTERVAL_MS);
   }
 }
 
@@ -118,22 +160,21 @@ function getLocalTimestamp(timezone: string = 'Asia/Kolkata'): string {
 function performDirectClockoutAsync(
   session: any,
   reason: string,
+  timestamp: string,
 ): Promise<void> {
   return new Promise((resolve) => {
     try {
       const serverUrl =
-        session.serverUrl || 'http://localhost/api/plugin/timetracker';
+        session.serverUrl || 'https://app.nsventures.in/api/plugin/timetracker';
       const endpoint = `${serverUrl}/log-update`;
       console.log(
         `[DEBUG] Graceful shutdown async: Sending direct native HTTP/HTTPS clockout request to ${endpoint}...`,
       );
 
-      const formattedDate = getLocalTimestamp(session.timezone);
-
       const payload = JSON.stringify({
         user_id: session.userId,
         action: 'clock-out',
-        timestamp: formattedDate,
+        timestamp,
         reason,
       });
 
@@ -222,12 +263,19 @@ function handleGracefulShutdown(event: any, source: string): void {
       const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
       if (session && session.isClockedIn && session.token && session.userId) {
         const clockoutReason = describeClockoutTrigger(effectiveSource);
+        // Stamp the clock-out at the last heartbeated active time (written every
+        // 30s by the renderer while clocked in), not "now" — otherwise an
+        // overnight sleep or a crash-then-reboot counts every dead minute up to
+        // the reboot as worked. Fall back to now only if no heartbeat exists.
+        const clockoutTimestamp =
+          typeof session.lastActiveTime === 'string' && session.lastActiveTime
+            ? session.lastActiveTime
+            : getLocalTimestamp(session.timezone);
         log.info(
-          `[lifecycle] User still clocked in at ${effectiveSource}; clocking out. Reason: "${clockoutReason}"`,
+          `[lifecycle] User still clocked in at ${effectiveSource}; clocking out at ${clockoutTimestamp}. Reason: "${clockoutReason}"`,
         );
-        const lastActiveTime = getLocalTimestamp(session.timezone);
         session.isClockedIn = false;
-        session.lastActiveTime = lastActiveTime;
+        session.lastActiveTime = clockoutTimestamp;
         fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2));
 
         isClockoutInitiated = true;
@@ -246,7 +294,7 @@ function handleGracefulShutdown(event: any, source: string): void {
         // Fallback safety timeout
         setTimeout(finish, 4500);
 
-        performDirectClockoutAsync(session, clockoutReason)
+        performDirectClockoutAsync(session, clockoutReason, clockoutTimestamp)
           .then(finish)
           .catch((err) => {
             console.error(`[DEBUG] Async clockout promise rejection:`, err);
@@ -312,6 +360,12 @@ ipcMain.on('ipc-example', async (event, arg) => {
   event.reply('ipc-example', msgTemplate('pong'));
 });
 
+// Renderer-side crashes (window.onerror / unhandledrejection) are forwarded
+// here so they land in the same persistent main.log as everything else.
+ipcMain.on('log-error', (_event, payload) => {
+  log.error('[crash] Renderer error:', payload);
+});
+
 // Handle idle time check
 ipcMain.handle('get-idle-time', () => {
   return powerMonitor.getSystemIdleTime();
@@ -362,6 +416,38 @@ ipcMain.handle('delete-file', async (_, filePath) => {
     return { error: true, message: `Error deleting file: ${error}` };
   }
 });
+
+// A blank/failed capture (missing permission, Wayland portal denied) still
+// produces a valid but near-empty PNG. Below this it is almost certainly not a
+// real screen, so it is dropped rather than uploaded as useless evidence.
+const MIN_SCREENSHOT_BYTES = 2048;
+let lastScreenshotSignature: string | null = null;
+
+/**
+ * Validate a screenshot buffer before it is saved. Returns false to drop the
+ * frame. Identical-to-previous frames are logged (a static screen is
+ * legitimate) rather than dropped.
+ */
+function isUsableScreenshot(buffer: Buffer, source: string): boolean {
+  if (!buffer || buffer.length === 0) {
+    log.warn(`[capture] ${source}: empty screenshot buffer — dropped`);
+    return false;
+  }
+  if (buffer.length < MIN_SCREENSHOT_BYTES) {
+    log.warn(
+      `[capture] ${source}: screenshot only ${buffer.length} bytes — likely blank, dropped`,
+    );
+    return false;
+  }
+  const signature = crypto.createHash('md5').update(buffer).digest('hex');
+  if (signature === lastScreenshotSignature) {
+    log.warn(
+      `[capture] ${source}: screenshot byte-identical to previous frame — capture may be frozen`,
+    );
+  }
+  lastScreenshotSignature = signature;
+  return true;
+}
 
 let hasPromptedForScreenAccess = false;
 
@@ -439,6 +525,17 @@ ipcMain.on('take-screenshot', async (event) => {
 
     if (sources.length > 0) {
       const primaryDisplay = sources[0];
+
+      // Convert NativeImage to buffer and validate before writing anything.
+      const imageBuffer = primaryDisplay.thumbnail.toPNG();
+      if (
+        primaryDisplay.thumbnail.isEmpty() ||
+        !isUsableScreenshot(imageBuffer, 'desktopCapturer')
+      ) {
+        event.reply('screenshot-taken', '');
+        return;
+      }
+
       const screenshotPath = path.join(app.getPath('userData'), 'screenshots');
       console.log(
         `[DEBUG] Main process: Screenshot directory: ${screenshotPath}`,
@@ -455,8 +552,6 @@ ipcMain.on('take-screenshot', async (event) => {
       const filePath = path.join(screenshotPath, `screenshot-${timestamp}.png`);
       console.log(`[DEBUG] Main process: Saving screenshot to: ${filePath}`);
 
-      // Convert NativeImage to buffer and save to file
-      const imageBuffer = primaryDisplay.thumbnail.toPNG();
       fs.writeFileSync(filePath, imageBuffer);
       console.log('[DEBUG] Main process: Screenshot saved successfully');
 
@@ -504,6 +599,13 @@ ipcMain.handle('save-screenshot-buffer', async (_, base64Data: string) => {
       return { error: true, message: 'Empty screenshot buffer', filePath: '' };
     }
 
+    const buffer = Buffer.from(base64Data, 'base64');
+    // Drop blank/failed captures (a denied Wayland portal yields a valid but
+    // near-empty PNG) rather than saving and uploading them.
+    if (!isUsableScreenshot(buffer, 'getDisplayMedia')) {
+      return { error: true, message: 'Blank screenshot dropped', filePath: '' };
+    }
+
     const screenshotPath = path.join(app.getPath('userData'), 'screenshots');
     if (!fs.existsSync(screenshotPath)) {
       fs.mkdirSync(screenshotPath, { recursive: true });
@@ -511,18 +613,11 @@ ipcMain.handle('save-screenshot-buffer', async (_, base64Data: string) => {
 
     const timestamp = new Date().toISOString().replace(/:/g, '-');
     const filePath = path.join(screenshotPath, `screenshot-${timestamp}.png`);
-    const buffer = Buffer.from(base64Data, 'base64');
     fs.writeFileSync(filePath, buffer);
 
     console.log(
       `[DEBUG] Main process: Saved renderer screenshot (${buffer.length} bytes) to ${filePath}`,
     );
-
-    if (buffer.length === 0) {
-      console.error(
-        '[DEBUG] Main process: Renderer screenshot buffer was empty',
-      );
-    }
 
     return { error: false, message: 'Screenshot saved', filePath };
   } catch (error) {
@@ -955,20 +1050,42 @@ app.on('window-all-closed', () => {
   }
 });
 
-app
-  .whenReady()
-  .then(() => {
-    // One line that makes a terminal launch self-diagnosing on any platform.
-    console.log(
-      `[DEBUG] Main process: Starting ${app.getName()} ${app.getVersion()} — ` +
-        `electron ${process.versions.electron}, ${process.platform}/${process.arch}, ` +
-        `packaged=${app.isPackaged}, userData=${app.getPath('userData')}`,
+// A second copy of the tracker running at once would double-count activity and
+// take duplicate screenshots. Hold a single-instance lock; if another instance
+// already owns it, surface that window and quit this one.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  log.info(
+    '[lifecycle] Another instance is already running; quitting this one',
+  );
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    log.info(
+      '[lifecycle] Second-instance launch detected; focusing existing window',
     );
-    createWindow();
-    app.on('activate', () => {
-      // On macOS it's common to re-create a window in the app when the
-      // dock icon is clicked and there are no other windows open.
-      if (mainWindow === null) createWindow();
-    });
-  })
-  .catch(console.log);
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+
+  app
+    .whenReady()
+    .then(() => {
+      // One line that makes a terminal launch self-diagnosing on any platform.
+      console.log(
+        `[DEBUG] Main process: Starting ${app.getName()} ${app.getVersion()} — ` +
+          `electron ${process.versions.electron}, ${process.platform}/${process.arch}, ` +
+          `packaged=${app.isPackaged}, userData=${app.getPath('userData')}`,
+      );
+      createWindow();
+      app.on('activate', () => {
+        // On macOS it's common to re-create a window in the app when the
+        // dock icon is clicked and there are no other windows open.
+        if (mainWindow === null) createWindow();
+      });
+    })
+    .catch(console.log);
+}

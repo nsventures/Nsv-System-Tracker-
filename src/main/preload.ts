@@ -22,7 +22,8 @@ export type Channels =
   | 'save-session'
   | 'get-session'
   | 'get-display-env'
-  | 'save-screenshot-buffer';
+  | 'save-screenshot-buffer'
+  | 'log-error';
 
 const electronHandler = {
   ipcRenderer: {

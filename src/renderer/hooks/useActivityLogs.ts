@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ActivityLog } from '../types';
 import { databaseService } from '../services';
-import { whiteLabelConfig } from '../../whiteLabel.config';
+import { deriveClockState } from '../utils/clockState';
 
 interface UseActivityLogsResult {
   activityLogs: ActivityLog[];
@@ -94,57 +94,19 @@ function useActivityLogs(userId: number | undefined): UseActivityLogsResult {
         `[DEBUG] useActivityLogs: Calculated history duration: ${calculatedHistoryDuration}ms`,
       );
 
-      if (userClockLogs.length > 0) {
-        const lastClockInLog = userClockLogs[0];
-        console.log(
-          `[DEBUG] useActivityLogs: Last clock log: ${JSON.stringify(lastClockInLog)}`,
-        );
-
-        let isCurrentlyClocked = lastClockInLog.action === 'clock-in';
-        const lastClockTime = new Date(
-          lastClockInLog.timestamp.replace(/\s/, 'T'),
-        );
-        if (
-          isCurrentlyClocked &&
-          lastClockTime.toDateString() !== todayDateString
-        ) {
-          console.log(
-            '[DEBUG] useActivityLogs: Last clock-in log is from a previous day. Forcing clocked-out state locally.',
-          );
-          isCurrentlyClocked = false;
-        }
-
-        console.log(
-          `[DEBUG] useActivityLogs: User is ${isCurrentlyClocked ? 'clocked in' : 'not clocked in'}`,
-        );
-        setIsClockedIn(isCurrentlyClocked);
-
-        // If clocked in, set the clock-in time
-        if (isCurrentlyClocked) {
-          // Parse the timestamp string with timezone awareness
-          // The timestamp format is "YYYY-MM-DD HH:MM:SS" created with timezone from whiteLabelConfig
-          // We need to parse it in a way that respects the original timezone
-
-          // Convert "YYYY-MM-DD HH:MM:SS" to a format JavaScript can parse better
-          // Replace spaces with 'T' and add the timezone identifier
-          const formattedTimestamp = `${lastClockInLog.timestamp.replace(/\s/, 'T')}`;
-          console.log(
-            `[DEBUG] Parsing timestamp: ${formattedTimestamp} with timezone: ${whiteLabelConfig.timezone.default}`,
-          );
-
-          const clockInTimestamp = new Date(formattedTimestamp);
-          setClockInTime(clockInTimestamp);
-        } else {
-          // If clocked out, reset the timer
-          setClockInTime(null);
-        }
-      } else {
-        console.log(
-          '[DEBUG] useActivityLogs: No clock logs found for this user, user is not clocked in',
-        );
-        setIsClockedIn(false);
-        setClockInTime(null);
-      }
+      // Clock state comes from the shared helper so this hook and the activity
+      // service cannot disagree. See utils/clockState.ts.
+      const {
+        isClockedIn: isCurrentlyClocked,
+        clockInTime: derivedClockInTime,
+      } = deriveClockState(userLogs, userId);
+      console.log(
+        `[DEBUG] useActivityLogs: User is ${
+          isCurrentlyClocked ? 'clocked in' : 'not clocked in'
+        }`,
+      );
+      setIsClockedIn(isCurrentlyClocked);
+      setClockInTime(derivedClockInTime);
 
       // Check if user is on break
       const userBreakLogs = userLogs
@@ -166,7 +128,23 @@ function useActivityLogs(userId: number | undefined): UseActivityLogsResult {
         console.log(
           `[DEBUG] useActivityLogs: Last break log: ${JSON.stringify(lastBreakLog)}`,
         );
-        const isOnBreakNow = lastBreakLog.action === 'break-start';
+        let isOnBreakNow = lastBreakLog.action === 'break-start';
+
+        // Mirror the clock-in guard above: a break-start left open from a
+        // PREVIOUS day is stale (the break should have closed at day end), so
+        // never carry it into today. Without this, an orphaned prior-day
+        // break-start keeps the UI stuck showing "End Break" indefinitely — and
+        // because activity.ts already ignores it, clicking End Break no-ops.
+        const lastBreakTime = new Date(
+          lastBreakLog.timestamp.replace(/\s/, 'T'),
+        );
+        if (isOnBreakNow && lastBreakTime.toDateString() !== todayDateString) {
+          console.log(
+            '[DEBUG] useActivityLogs: Last break-start is from a previous day. Forcing not-on-break state locally.',
+          );
+          isOnBreakNow = false;
+        }
+
         console.log(
           `[DEBUG] useActivityLogs: User is ${isOnBreakNow ? 'on break' : 'not on break'}`,
         );

@@ -8,6 +8,7 @@ import {
 } from '../types';
 import databaseService from './database';
 import whiteLabelConfig from '../../whiteLabel.config';
+import { MAX_SYNC_ATTEMPTS, isInBackoff } from '../utils/syncBackoff';
 
 // API base URL from white label configuration
 const API_BASE_URL = whiteLabelConfig.app.apiBaseUrl;
@@ -277,10 +278,28 @@ export async function syncUnsyncedLogs(
   let forceClockoutDetected = false;
 
   for (const log of sortedLogs) {
+    // Space out retries of a repeatedly-failing item so it doesn't re-hit the
+    // server every 60s and block healthy items behind it.
+    if (isInBackoff(log)) {
+      console.log(
+        `[API] Skipping ${log.action} (in backoff, attempt ${log.attempts})`,
+      );
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
     console.log(
       `[API] Syncing log: ${log.action} at ${log.timestamp} (ID: ${log.id})`,
     );
-    const { id, synced, ...logData } = log;
+    const { id } = log;
+    // Send only the four contract fields — never the local queue bookkeeping
+    // (attempts/lastAttemptAt/deadLettered/syncError) or the synced flag.
+    const logData = {
+      user_id: log.user_id,
+      action: log.action,
+      timestamp: log.timestamp,
+      reason: log.reason,
+    };
     const response = await apiRequest<ActivityLog>(
       'log-update',
       'POST',
@@ -315,9 +334,23 @@ export async function syncUnsyncedLogs(
       await databaseService.markActivityLogAsSynced(id!);
       console.log(`[API] Successfully synced log: ${log.action}`);
     } else {
-      console.error(
-        `[API] Failed to sync log: ${log.action}, error: ${response.message}`,
-      );
+      // Transient failure (5xx / network). Count the attempt so it backs off,
+      // and dead-letter only at the high safety cap so a poison item can't
+      // grow the queue forever — while a real outage keeps retrying.
+      const attemptCount = await databaseService.bumpActivityLogAttempts(id!);
+      if (attemptCount >= MAX_SYNC_ATTEMPTS) {
+        console.error(
+          `[API] Dead-lettering log after ${attemptCount} attempts: ${log.action} at ${log.timestamp} — ${response.message}`,
+        );
+        await databaseService.deadLetterActivityLog(
+          id!,
+          response.message || 'unknown sync error',
+        );
+      } else {
+        console.error(
+          `[API] Failed to sync log (attempt ${attemptCount}/${MAX_SYNC_ATTEMPTS}): ${log.action}, error: ${response.message}`,
+        );
+      }
     }
   }
 
@@ -482,6 +515,15 @@ export async function syncUnsyncedScreenshots(
   );
 
   for (const screenshot of unsyncedScreenshots) {
+    // Back off a repeatedly-failing upload instead of retrying it every cycle.
+    if (isInBackoff(screenshot)) {
+      console.log(
+        `[API] Skipping screenshot ${screenshot.id} (in backoff, attempt ${screenshot.attempts})`,
+      );
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
     console.log(
       `[API] Syncing screenshot: ${screenshot.filePath} (ID: ${screenshot.id})`,
     );
@@ -521,6 +563,45 @@ export async function syncUnsyncedScreenshots(
         console.error(
           'Error deleting synced screenshot file from disk:',
           error,
+        );
+      }
+    } else if (isTerminalRejection(response)) {
+      // The server will reject this upload every time (e.g. 422). Retiring it
+      // reclaims the disk and stops it looping forever.
+      console.error(
+        `[API] Dropping permanently rejected screenshot ${screenshot.id} ` +
+          `(status ${response.status}, code ${response.code})`,
+      );
+      await databaseService.deadLetterScreenshot(
+        screenshot.id!,
+        response.message || 'terminal rejection',
+      );
+      try {
+        await window.electron.system.deleteFile(screenshot.filePath);
+      } catch (error) {
+        console.error('Error deleting rejected screenshot file:', error);
+      }
+    } else {
+      // Transient failure: back off, and dead-letter only at the safety cap.
+      const attemptCount = await databaseService.bumpScreenshotAttempts(
+        screenshot.id!,
+      );
+      if (attemptCount >= MAX_SYNC_ATTEMPTS) {
+        console.error(
+          `[API] Dead-lettering screenshot ${screenshot.id} after ${attemptCount} attempts — ${response.message}`,
+        );
+        await databaseService.deadLetterScreenshot(
+          screenshot.id!,
+          response.message || 'unknown sync error',
+        );
+        try {
+          await window.electron.system.deleteFile(screenshot.filePath);
+        } catch (error) {
+          console.error('Error deleting dead-lettered screenshot file:', error);
+        }
+      } else {
+        console.error(
+          `[API] Failed to upload screenshot ${screenshot.id} (attempt ${attemptCount}/${MAX_SYNC_ATTEMPTS}): ${response.message}`,
         );
       }
     }

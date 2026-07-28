@@ -6,6 +6,7 @@ import * as databaseService from './database';
 import screenshotService from './screenshot';
 import { whiteLabelConfig } from '../../whiteLabel.config';
 import { formatApiTimestamp } from '../utils/timeUtils';
+import { deriveClockState } from '../utils/clockState';
 
 // Activity types
 export type ActivityAction =
@@ -43,7 +44,11 @@ class ActivityService {
 
   private isOnBreak: boolean = false;
 
+  private isOnManualTime: boolean = false;
+
   private lastActivityTime: number = Date.now();
+
+  private lastSessionActiveWriteAt: number = 0; // throttle for the session heartbeat
 
   private totalBreakTime: number = 0;
 
@@ -349,8 +354,28 @@ class ActivityService {
     this.idlePollInterval = setInterval(async () => {
       try {
         const idleTimeSec = await (window as any).electron.system.getIdleTime();
-        const idleTimeMs = idleTimeSec * 1000; // Convert seconds → milliseconds
+        let idleTimeMs = Number.isFinite(idleTimeSec)
+          ? Math.max(0, idleTimeSec * 1000)
+          : 0;
+
+        // Cross-check the OS idle timer against input the tracker window itself
+        // saw. If in-app input is more recent than the OS claims, trust it —
+        // getSystemIdleTime() over-reports idle on some platforms (Wayland),
+        // and this never increases idle, only corrects a false-idle reading.
+        const sinceRendererInput = Date.now() - this.lastActivityTime;
+        if (Number.isFinite(sinceRendererInput) && sinceRendererInput >= 0) {
+          idleTimeMs = Math.min(idleTimeMs, sinceRendererInput);
+        }
+
         const clockedIn = await this.isUserClockedIn();
+
+        // Heartbeat: while clocked in, record the last moment the machine saw
+        // input into session.json, so a crash/sleep/shutdown clock-out is
+        // stamped there instead of at reboot — which would over-count every
+        // dead minute in between (see main.ts handleGracefulShutdown).
+        if (clockedIn) {
+          this.maybeWriteSessionActiveTime(Date.now() - idleTimeMs);
+        }
 
         // Only track idle when clocked in and not on break
         if (!clockedIn || this.isOnBreak) {
@@ -663,6 +688,16 @@ class ActivityService {
       `[DIAG] startManualTime called. Stack:\n${new Error().stack || '(no stack)'}`,
     );
 
+    // Guard against a duplicate start: a second manual-processing-start with no
+    // stop in between would open a second overlapping manual window and corrupt
+    // the manual-time total. Ignore it if one is already running.
+    if (this.isOnManualTime) {
+      console.warn(
+        '[DEBUG] startManualTime ignored: manual time is already running',
+      );
+      return;
+    }
+
     // Ensure user is clocked in before starting manual time
     const clockedIn = await this.isUserClockedIn();
     if (!clockedIn) {
@@ -685,11 +720,13 @@ class ActivityService {
     }
 
     // Log manual time start
+    this.isOnManualTime = true;
     await this.logActivity('manual-processing-start');
   }
 
   // Manually stop manual time tracking with reason
   public async stopManualTime(reason: string) {
+    this.isOnManualTime = false;
     const timestamp = formatApiTimestamp();
 
     const logData: LogUpdateRequest = {
@@ -759,71 +796,14 @@ class ActivityService {
     }
 
     try {
-      console.log(
-        `[DEBUG] isUserClockedIn: Checking clock status for user ID: ${this.userId}`,
-      );
-
-      // Get all activity logs
+      // Derived by the shared helper so the service and the dashboard hook can
+      // never disagree about clock state. See utils/clockState.ts.
       const logs = await databaseService.getActivityLogs();
+      const { isClockedIn } = deriveClockState(logs, this.userId);
       console.log(
-        `[DEBUG] isUserClockedIn: Retrieved ${logs.length} total activity logs`,
-      );
-
-      // Log the synced status of each log to help with debugging
-      logs.forEach((log) => {
-        if (log.action === 'clock-in' || log.action === 'clock-out') {
-          console.log(
-            `[DEBUG] isUserClockedIn: Found ${log.action} log for user ID: ${log.user_id}, synced: ${log.synced}, timestamp: ${log.timestamp}`,
-          );
-        }
-      });
-
-      // Filter logs to only include clock-in and clock-out events for this user
-      const userClockLogs = logs.filter(
-        (log) =>
-          (log.action === 'clock-in' || log.action === 'clock-out') &&
-          log.user_id === this.userId,
-      );
-
-      console.log(
-        `[DEBUG] isUserClockedIn: Found ${userClockLogs.length} clock logs for user ID: ${this.userId}`,
-      );
-
-      if (userClockLogs.length === 0) {
-        console.log(
-          '[DEBUG] isUserClockedIn: No clock logs found for this user, user is not clocked in',
-        );
-        return false;
-      }
-
-      // Sort by timestamp (most recent first)
-      const sortedUserClockLogs = userClockLogs.sort(
-        (a, b) =>
-          new Date(b.timestamp.replace(/\s/, 'T')).getTime() -
-          new Date(a.timestamp.replace(/\s/, 'T')).getTime(),
-      );
-
-      // Get the most recent clock log
-      const lastClockInLog = sortedUserClockLogs[0];
-      console.log(
-        `[DEBUG] isUserClockedIn: Last clock log for user: ${JSON.stringify(lastClockInLog)}`,
-      );
-
-      let isClockedIn = lastClockInLog.action === 'clock-in';
-      const lastClockTime = new Date(
-        lastClockInLog.timestamp.replace(/\s/, 'T'),
-      );
-      if (
-        isClockedIn &&
-        lastClockTime.toDateString() !== new Date().toDateString()
-      ) {
-        console.log(
-          '[DEBUG] isUserClockedIn: Last clock-in log is from a previous day. Forcing clocked-out state locally.',
-        );
-        isClockedIn = false;
-      }
-      console.log(
-        `[DEBUG] isUserClockedIn: Most recent action is ${lastClockInLog.action}, user is ${isClockedIn ? 'clocked in' : 'not clocked in'}`,
+        `[DEBUG] isUserClockedIn: user ${this.userId} is ${
+          isClockedIn ? 'clocked in' : 'not clocked in'
+        }`,
       );
       return isClockedIn;
     } catch (error) {
@@ -942,6 +922,28 @@ class ActivityService {
     }
   }
 
+  /**
+   * Heartbeat the last time the machine actually saw input into session.json,
+   * throttled to once every 30s. The main process reads this on shutdown to
+   * stamp an OS-quit clock-out at the real last-active moment rather than at
+   * reboot time, and to self-heal a crashed session on next launch.
+   */
+  private maybeWriteSessionActiveTime(lastActiveEpochMs: number) {
+    const now = Date.now();
+    if (now - this.lastSessionActiveWriteAt < 30000) return;
+    this.lastSessionActiveWriteAt = now;
+
+    if (typeof window !== 'undefined' && window.electron) {
+      const safeEpoch =
+        Number.isFinite(lastActiveEpochMs) && lastActiveEpochMs <= now
+          ? lastActiveEpochMs
+          : now;
+      window.electron.ipcRenderer.sendMessage('save-session', {
+        lastActiveTime: formatApiTimestamp(new Date(safeEpoch)),
+      });
+    }
+  }
+
   // Clean up
   public cleanup() {
     if (this.idleTimeout) {
@@ -970,6 +972,7 @@ class ActivityService {
     this.token = null;
     this.isIdle = false;
     this.isOnBreak = false;
+    this.isOnManualTime = false;
     this.totalBreakTime = 0;
     this.breakStartTime = null;
   }
