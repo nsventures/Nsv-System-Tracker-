@@ -18,6 +18,7 @@ export type Channels =
   | 'check-clock-in-status'
   | 'clock-in-status-response'
   | 'system-suspend-before-715'
+  | 'system-resume'
   | 'clock-out-complete'
   | 'save-session'
   | 'get-session'

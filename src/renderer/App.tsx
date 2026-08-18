@@ -116,6 +116,19 @@ export default function App() {
       },
     );
 
+    const resumeCleanup = window.electron.ipcRenderer.on(
+      'system-resume',
+      async () => {
+        try {
+          console.log('Received system-resume message from main process');
+          const { activityService } = await import('./services/index.js');
+          await activityService.markAsIdleAfterResume();
+        } catch (error) {
+          console.error('Error handling system-resume:', error);
+        }
+      },
+    );
+
     const checkStatusCleanup = window.electron.ipcRenderer.on(
       'check-clock-in-status',
       async () => {
@@ -149,6 +162,7 @@ export default function App() {
     return () => {
       clockOutCleanup();
       suspendBefore715Cleanup();
+      resumeCleanup();
       checkStatusCleanup();
     };
   }, [isElectron]);

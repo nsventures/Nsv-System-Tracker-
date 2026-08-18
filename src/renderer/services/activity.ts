@@ -32,9 +32,19 @@ class ActivityService {
 
   private idlePollInterval: NodeJS.Timeout | null = null;
 
+  private configReloadInterval: NodeJS.Timeout | null = null;
+
   private idlePollFrequency: number = 5000; // poll every 5s
 
-  private idleThreshold: number = 60000; // Default 1 minute (ms)
+  // Must match the admin default (5 minutes). The previous 1-minute fallback
+  // is why short 00:01 / 00:02 idle bars appeared whenever load-config failed
+  // or had not been applied yet — the poller ran on the 1-minute default.
+  private idleThreshold: number = 300000;
+
+  // Once idle, require real input (OS idle near zero) before leaving idle.
+  // Exiting as soon as idleTime < threshold caused 1–2 minute leftover bars
+  // after every 5-minute wait.
+  private static readonly IDLE_RESUME_MS = 5000;
 
   private breakThreshold: number = 300000; // Default 5 minutes
 
@@ -77,12 +87,14 @@ class ActivityService {
 
     // Load configuration
     await this.loadConfig();
+    this.startConfigReload();
 
     // Load persisted break time from config
     await this.loadPersistedBreakTime();
 
-    // Restore break state from database logs
+    // Restore break/idle state from database logs before polling starts
     await this.restoreBreakState();
+    await this.restoreIdleState();
 
     // Start idle detection
     this.startIdleDetection();
@@ -100,6 +112,9 @@ class ActivityService {
           const lastActiveTime =
             session.lastActiveTime ||
             window.electron.system.getCurrentTimestamp();
+          const clockOutAt = new Date(lastActiveTime.replace(/\s/, 'T'));
+
+          await this.closeOpenActivitiesBeforeClockOut(clockOutAt);
 
           const clockOutLog = {
             user_id: this.userId!,
@@ -109,8 +124,6 @@ class ActivityService {
           };
 
           await databaseService.saveActivityLog(clockOutLog);
-          this.isIdle = false;
-          this.isOnBreak = false;
           console.log(
             '[DEBUG] Self-healing complete. Local database has been clocked out.',
           );
@@ -127,6 +140,15 @@ class ActivityService {
 
     const clockedIn = await this.isUserClockedIn();
     this.updateSessionFile(clockedIn);
+    if (clockedIn && this.userId) {
+      try {
+        const logs = await databaseService.getActivityLogs();
+        const { clockInTime } = deriveClockState(logs, this.userId);
+        if (clockInTime) this.lastClockInAt = clockInTime.getTime();
+      } catch (error) {
+        console.error('Error restoring lastClockInAt:', error);
+      }
+    }
   }
 
   // Load persisted break time from config
@@ -269,6 +291,7 @@ class ActivityService {
           );
           this.isOnBreak = true;
           this.breakStartTime = lastLogTime.getTime();
+          this.scheduleBreakLimitTimers();
         } else {
           this.isOnBreak = false;
           this.breakStartTime = null;
@@ -279,16 +302,205 @@ class ActivityService {
     }
   }
 
+  private parseLogTimestamp(timestamp: string): Date {
+    return new Date(timestamp.replace(/\s/, 'T'));
+  }
+
+  private async getTodayIdleLogs() {
+    if (!this.userId) return [];
+    const today = new Date().toDateString();
+    const logs = await databaseService.getActivityLogs();
+    return logs
+      .filter(
+        (log) =>
+          log.user_id === this.userId &&
+          (log.action === 'idle-start' || log.action === 'idle-stop') &&
+          this.parseLogTimestamp(log.timestamp).toDateString() === today,
+      )
+      .sort(
+        (a, b) =>
+          this.parseLogTimestamp(a.timestamp).getTime() -
+          this.parseLogTimestamp(b.timestamp).getTime(),
+      );
+  }
+
+  private async getTodayBreakLogs() {
+    if (!this.userId) return [];
+    const today = new Date().toDateString();
+    const logs = await databaseService.getActivityLogs();
+    return logs
+      .filter(
+        (log) =>
+          log.user_id === this.userId &&
+          (log.action === 'break-start' || log.action === 'break-stop') &&
+          this.parseLogTimestamp(log.timestamp).toDateString() === today,
+      )
+      .sort(
+        (a, b) =>
+          this.parseLogTimestamp(a.timestamp).getTime() -
+          this.parseLogTimestamp(b.timestamp).getTime(),
+      );
+  }
+
+  private hasMatchingStopAfter(
+    logs: { action: string }[],
+    startIndex: number,
+    stopAction: 'idle-stop' | 'break-stop',
+  ): boolean {
+    for (let i = startIndex + 1; i < logs.length; i += 1) {
+      if (logs[i].action === stopAction) return true;
+      if (
+        logs[i].action === 'idle-start' ||
+        logs[i].action === 'break-start'
+      ) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  private async getSystemIdleMs(): Promise<number> {
+    try {
+      const idleTimeSec = await (window as any).electron.system.getIdleTime();
+      return Number.isFinite(idleTimeSec)
+        ? Math.max(0, idleTimeSec * 1000)
+        : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Close an idle-start in logs that never received idle-stop (server orphan). */
+  private async closeOrphanedIdleFromLogs(
+    reason: string,
+    at: Date = new Date(),
+  ): Promise<boolean> {
+    const idleLogs = await this.getTodayIdleLogs();
+    for (let i = idleLogs.length - 1; i >= 0; i -= 1) {
+      if (idleLogs[i].action !== 'idle-start') continue;
+      if (this.hasMatchingStopAfter(idleLogs, i, 'idle-stop')) return false;
+
+      console.log(`[idle] Closing orphaned idle-start (reason=${reason})`);
+      this.isIdle = false;
+      await this.logActivity('idle-stop', at);
+      return true;
+    }
+    return false;
+  }
+
+  /** Close a break-start in logs that never received break-stop (server orphan). */
+  private async closeOrphanedBreakFromLogs(
+    reason: string,
+    at: Date = new Date(),
+  ): Promise<boolean> {
+    const breakLogs = await this.getTodayBreakLogs();
+    for (let i = breakLogs.length - 1; i >= 0; i -= 1) {
+      if (breakLogs[i].action !== 'break-start') continue;
+      if (this.hasMatchingStopAfter(breakLogs, i, 'break-stop')) return false;
+
+      console.log(`[break] Closing orphaned break-start (reason=${reason})`);
+      this.clearBreakTimers();
+      await this.logActivity('break-stop', at);
+      await this.recalculateBreakTime();
+      this.isOnBreak = false;
+      this.breakStartTime = null;
+      return true;
+    }
+    return false;
+  }
+
+  /** Always close idle/break (memory + log orphans) before clock-out. */
+  private async closeOpenActivitiesBeforeClockOut(
+    at: Date = new Date(),
+  ): Promise<void> {
+    if (this.isIdle) {
+      this.isIdle = false;
+      await this.logActivity('idle-stop', at);
+    } else {
+      await this.closeOrphanedIdleFromLogs('clock-out', at);
+    }
+
+    if (this.isOnBreak) {
+      await this.stopBreak(at);
+    } else {
+      await this.closeOrphanedBreakFromLogs('clock-out', at);
+    }
+  }
+
+  /** On startup: reconcile in-memory idle with the last idle log row. */
+  private async restoreIdleState() {
+    if (!this.userId) return;
+    try {
+      const idleLogs = await this.getTodayIdleLogs();
+      if (idleLogs.length === 0) {
+        this.isIdle = false;
+        return;
+      }
+
+      const last = idleLogs[idleLogs.length - 1];
+      if (last.action !== 'idle-start') {
+        this.isIdle = false;
+        return;
+      }
+
+      const osIdleMs = await this.getSystemIdleMs();
+      if (osIdleMs < ActivityService.IDLE_RESUME_MS) {
+        console.log(
+          '[idle] Startup: open idle-start but user is active — closing',
+        );
+        this.isIdle = false;
+        await this.logActivity('idle-stop');
+      } else {
+        console.log('[idle] Startup: restoring in-memory idle state');
+        this.isIdle = true;
+      }
+    } catch (error) {
+      console.error('Error restoring idle state on startup:', error);
+    }
+  }
+
+  /** After sleep/wake: close idle that was opened on suspend if the user is back. */
+  public async markAsIdleAfterResume() {
+    try {
+      const clockedIn = await this.isUserClockedIn();
+      if (!clockedIn || this.isOnBreak) return;
+
+      const osIdleMs = await this.getSystemIdleMs();
+      if (osIdleMs >= ActivityService.IDLE_RESUME_MS) {
+        return;
+      }
+
+      if (this.isIdle) {
+        this.isIdle = false;
+        await this.logActivity('idle-stop');
+        return;
+      }
+
+      await this.closeOrphanedIdleFromLogs('system-resume');
+    } catch (error) {
+      console.error('Error handling system resume:', error);
+    }
+  }
+
   // Save break time to config
   private async saveBreakTime() {
     try {
+      // Never seed a missing config row with a live in-memory threshold that
+      // might still be a pre-config-load value — always persist the 5-minute
+      // product default (or whatever already came from /load-config).
       const config = (await databaseService.getConfig()) || {
-        screenshotInterval: 300000, // Default 5 minutes
-        idleTimeThreshold: this.idleThreshold,
+        screenshotInterval: 300000,
+        idleTimeThreshold: 300000,
         breakTimeThreshold: this.breakThreshold,
         maxDailyBreakTime: this.maxDailyBreakTime,
         manualTimeApprover: [],
       };
+      if (
+        !config.idleTimeThreshold ||
+        config.idleTimeThreshold === 60000
+      ) {
+        config.idleTimeThreshold = this.idleThreshold || 300000;
+      }
 
       const today = new Date().toISOString().split('T')[0];
       if (!config.userBreakTimes) {
@@ -312,8 +524,67 @@ class ActivityService {
     }
   }
 
+  // Admin stores milliseconds (seconds from the form × 1000). Guard against
+  // a raw-seconds value leaking through, a missing/zero value, and the
+  // legacy 1-minute value that older builds wrote into IndexedDB.
+  private applyIdleThreshold(
+    raw: unknown,
+    source: 'server' | 'local' | 'default' = 'default',
+  ) {
+    const FALLBACK_MS = 300000; // 5 minutes — never fall back to 1 minute
+    const LEGACY_DEFAULT_MS = 60000;
+    const MAX_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+    const n = Number(raw);
+    let ms = Number.isFinite(n) && n > 0 ? n : FALLBACK_MS;
+
+    // Server/form sometimes sends seconds (e.g. 300) instead of ms.
+    if (ms < 60000) {
+      ms *= 1000;
+    }
+
+    // Older builds defaulted to 60s and cached it locally. Treat that local
+    // value as poison — keep the 5-minute floor until the server explicitly
+    // sends a threshold (including a deliberate 1-minute admin setting).
+    if (source === 'local' && ms === LEGACY_DEFAULT_MS) {
+      console.warn(
+        '[idle] Ignoring legacy local idleTimeThreshold=60000; using 5-minute default until server config applies',
+      );
+      ms = FALLBACK_MS;
+    }
+
+    if (ms > MAX_MS) {
+      ms = FALLBACK_MS;
+    }
+
+    this.idleThreshold = ms;
+    console.log(
+      `[idle] threshold set to ${this.idleThreshold}ms (source=${source})`,
+    );
+  }
+
+  private startConfigReload() {
+    if (this.configReloadInterval) {
+      clearInterval(this.configReloadInterval);
+    }
+    this.configReloadInterval = setInterval(() => {
+      this.loadConfig().catch((error) => {
+        console.error('Periodic config reload failed:', error);
+      });
+    }, 15 * 60 * 1000);
+  }
+
   // Load configuration from the server or local storage
   private async loadConfig() {
+    try {
+      const local = await databaseService.getConfig();
+      if (local?.idleTimeThreshold) {
+        this.applyIdleThreshold(local.idleTimeThreshold, 'local');
+      }
+    } catch (error) {
+      console.error('Error reading local config:', error);
+    }
+
     if (!this.token || !this.workspaceId) {
       console.error('Cannot load config: missing token or workspace ID');
       return;
@@ -326,15 +597,21 @@ class ActivityService {
       );
 
       if (!response.error && response.data) {
-        this.idleThreshold = response.data.idleTimeThreshold;
+        this.applyIdleThreshold(response.data.idleTimeThreshold, 'server');
         this.breakThreshold = response.data.breakTimeThreshold;
         this.maxDailyBreakTime = response.data.maxDailyBreakTime || 3600000;
-        console.log('Configuration loaded successfully');
+        console.log(
+          `Configuration loaded successfully (idle threshold ${this.idleThreshold}ms)`,
+        );
       } else {
-        console.error('Failed to load configuration:', response.message);
+        console.error(
+          `Failed to load configuration: ${response.message} — keeping idle threshold ${this.idleThreshold}ms`,
+        );
       }
     } catch (error) {
-      console.error('Error loading configuration:', error);
+      console.error(
+        `Error loading configuration: ${error} — keeping idle threshold ${this.idleThreshold}ms`,
+      );
     }
   }
 
@@ -394,13 +671,21 @@ class ActivityService {
         // getSystemIdleTime() over-reports idle on some platforms (Wayland),
         // tripping it even while the user was active. Idle is now only logged,
         // never acted on; users clock out themselves or an admin force-clocks.
-        if (idleTimeMs >= this.idleThreshold) {
-          if (!this.isIdle) {
-            this.isIdle = true;
-            await this.logActivity('idle-start');
-          }
-        } else if (this.isIdle) {
-          // Consider user active when recent
+        if (!this.isIdle && idleTimeMs >= this.idleThreshold) {
+          this.isIdle = true;
+          // Stamp idle-start at the beginning of this inactivity stretch, not
+          // "now". Logging "now" left the threshold wait as Active and then a
+          // 1–2 minute Idle leftover when the user returned — which looked
+          // like idle firing after 1 minute.
+          const startedAt = Math.max(
+            Date.now() - idleTimeMs,
+            this.lastClockInAt || 0,
+          );
+          console.log(
+            `[idle] idle-start (threshold=${this.idleThreshold}ms, osIdle=${Math.round(idleTimeMs / 1000)}s)`,
+          );
+          await this.logActivity('idle-start', new Date(startedAt));
+        } else if (this.isIdle && idleTimeMs < ActivityService.IDLE_RESUME_MS) {
           this.isIdle = false;
           await this.logActivity('idle-stop');
         }
@@ -424,30 +709,21 @@ class ActivityService {
     }
   }
 
-  // Handle user activity
+  // Handle user activity inside the tracker window.
+  // Only refresh lastActivityTime — do NOT emit idle-stop here. Exiting idle
+  // through this path skipped the IDLE_RESUME_MS hysteresis and produced the
+  // 3–4s yellow bars. The poller exits idle when OS (or renderer) idle drops
+  // under IDLE_RESUME_MS, using this timestamp via Math.min above.
   private handleUserActivity = () => {
     this.lastActivityTime = Date.now();
-
-    // If user was idle, stop idle
-    if (this.isIdle) {
-      this.isIdle = false;
-      this.logActivity('idle-stop');
-    }
-    // No need to restart idle detection; we continuously poll system idle time
   };
-
-  // Handle idle state
-  private handleIdle() {
-    this.isIdle = true;
-    this.logActivity('idle-start');
-  }
 
   // Start a break only if currently clocked in
   private async startBreakIfClockedIn() {
     try {
       const clockedIn = await this.isUserClockedIn();
       if (clockedIn && !this.isOnBreak) {
-        this.startBreak();
+        await this.startBreak();
       }
     } catch (error) {
       console.error(
@@ -495,58 +771,16 @@ class ActivityService {
   }
 
   // Start a break
-  private startBreak() {
+  private async startBreak() {
     if (this.isOnBreak) return;
 
     this.isOnBreak = true;
     this.breakStartTime = Date.now();
-    this.logActivity('break-start');
-
-    // Check if break exceeds max daily break time
-    const remainingBreakTime = this.maxDailyBreakTime - this.totalBreakTime;
-    if (remainingBreakTime > 0) {
-      // Set a warning notification 30 seconds before the break ends
-      if (remainingBreakTime > 30000) {
-        if (this.breakWarningTimeout) {
-          clearTimeout(this.breakWarningTimeout);
-        }
-        this.breakWarningTimeout = setTimeout(() => {
-          if (this.isOnBreak) {
-            this.showNotification(
-              'Break Ending Soon',
-              'Your break will end automatically in 30 seconds due to daily break time limit.',
-            );
-          }
-        }, remainingBreakTime - 30000);
-      }
-
-      // Set timeout to end the break when remaining time is exhausted
-      if (this.breakEndTimeout) {
-        clearTimeout(this.breakEndTimeout);
-      }
-      this.breakEndTimeout = setTimeout(() => {
-        if (this.isOnBreak) {
-          this.showNotification(
-            'Break Ended',
-            'Your break has ended automatically because you reached your daily break time limit.',
-          );
-          this.stopBreak();
-        }
-      }, remainingBreakTime);
-    } else {
-      // No break time left for today
-      this.showNotification(
-        'Break Ended',
-        'Your break has ended automatically because you have used all your daily break time.',
-      );
-      this.stopBreak();
-    }
+    await this.logActivity('break-start');
+    this.scheduleBreakLimitTimers();
   }
 
-  // Stop a break
-  private async stopBreak() {
-    if (!this.isOnBreak || !this.breakStartTime) return;
-
+  private clearBreakTimers() {
     if (this.breakWarningTimeout) {
       clearTimeout(this.breakWarningTimeout);
       this.breakWarningTimeout = null;
@@ -555,8 +789,56 @@ class ActivityService {
       clearTimeout(this.breakEndTimeout);
       this.breakEndTimeout = null;
     }
+  }
 
-    const breakDuration = Date.now() - this.breakStartTime;
+  /** Re-arm or enforce the daily break cap (startup restore + new break). */
+  private scheduleBreakLimitTimers() {
+    if (!this.isOnBreak || !this.breakStartTime) return;
+
+    this.clearBreakTimers();
+
+    const elapsed = Date.now() - this.breakStartTime;
+    const remainingBreakTime =
+      this.maxDailyBreakTime - this.totalBreakTime - elapsed;
+
+    if (remainingBreakTime <= 0) {
+      this.showNotification(
+        'Break Ended',
+        'Your break has ended automatically because you have used all your daily break time.',
+      );
+      void this.stopBreak();
+      return;
+    }
+
+    if (remainingBreakTime > 30000) {
+      this.breakWarningTimeout = setTimeout(() => {
+        if (this.isOnBreak) {
+          this.showNotification(
+            'Break Ending Soon',
+            'Your break will end automatically in 30 seconds due to daily break time limit.',
+          );
+        }
+      }, remainingBreakTime - 30000);
+    }
+
+    this.breakEndTimeout = setTimeout(() => {
+      if (this.isOnBreak) {
+        this.showNotification(
+          'Break Ended',
+          'Your break has ended automatically because you reached your daily break time limit.',
+        );
+        void this.stopBreak();
+      }
+    }, remainingBreakTime);
+  }
+
+  // Stop a break
+  private async stopBreak(at: Date = new Date()) {
+    if (!this.isOnBreak || !this.breakStartTime) return;
+
+    this.clearBreakTimers();
+
+    const breakDuration = Math.max(0, at.getTime() - this.breakStartTime);
     this.totalBreakTime += breakDuration;
     this.isOnBreak = false;
     this.breakStartTime = null;
@@ -572,19 +854,19 @@ class ActivityService {
     // Save updated break time to config
     await this.saveBreakTime();
 
-    this.logActivity('break-stop');
+    await this.logActivity('break-stop', at);
 
     // Dispatch event to notify UI that break ended
     window.dispatchEvent(new CustomEvent('break-ended'));
   }
 
-  public async logActivity(action: ActivityAction) {
+  public async logActivity(action: ActivityAction, at: Date = new Date()) {
     if (!this.userId) {
       console.error('Cannot log activity: missing user ID');
       return;
     }
 
-    const timestamp = formatApiTimestamp();
+    const timestamp = formatApiTimestamp(at);
 
     const logData: LogUpdateRequest = {
       user_id: this.userId,
@@ -620,7 +902,7 @@ class ActivityService {
   // Clock in
   public async clockIn() {
     if (this.isOnBreak) {
-      this.stopBreak();
+      await this.stopBreak();
     }
     this.lastClockInAt = Date.now();
     await this.logActivity('clock-in');
@@ -634,13 +916,7 @@ class ActivityService {
 
   // Clock out
   public async clockOut() {
-    if (this.isIdle) {
-      await this.logActivity('idle-stop');
-      this.isIdle = false;
-    }
-    if (this.isOnBreak) {
-      this.stopBreak();
-    }
+    await this.closeOpenActivitiesBeforeClockOut();
 
     // Removed resetDailyBreakTime() call to persist break time across clock-ins on the same day
 
@@ -670,13 +946,13 @@ class ActivityService {
       await this.logActivity('idle-stop');
       this.isIdle = false;
     }
-    this.startBreak();
+    await this.startBreak();
   }
 
   // Manually stop a break
   public async stopBreakManually() {
     if (!this.isOnBreak) return;
-    this.stopBreak();
+    await this.stopBreak();
   }
 
   // Manually start manual time tracking
@@ -872,9 +1148,7 @@ class ActivityService {
     console.log('[DEBUG] Stopping screenshot service');
     screenshotService.stop();
 
-    // 2. Clear timers and intervals
-    this.isIdle = false;
-    this.isOnBreak = false;
+    // 2. Clear timers and intervals (state flags cleared by closeOpenActivities)
     if (this.idleTimeout) {
       clearTimeout(this.idleTimeout);
       this.idleTimeout = null;
@@ -884,7 +1158,9 @@ class ActivityService {
       this.idlePollInterval = null;
     }
 
-    // 3. Log clock-out locally
+    // 3. Close idle/break on the server, then clock out locally
+    await this.closeOpenActivitiesBeforeClockOut();
+
     const clockOutLog = {
       user_id: this.userId!,
       action: 'clock-out' as const,
@@ -953,6 +1229,10 @@ class ActivityService {
     if (this.idlePollInterval) {
       clearInterval(this.idlePollInterval);
       this.idlePollInterval = null;
+    }
+    if (this.configReloadInterval) {
+      clearInterval(this.configReloadInterval);
+      this.configReloadInterval = null;
     }
     if (this.breakWarningTimeout) {
       clearTimeout(this.breakWarningTimeout);

@@ -980,7 +980,6 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  // Listen for system suspend/sleep and shutdown events
   powerMonitor.on('suspend', () => {
     console.log('[DEBUG] Main process: System entering suspend/sleep mode');
     if (!mainWindow) return;
@@ -1012,6 +1011,12 @@ const createWindow = async () => {
       );
       mainWindow.webContents.send('system-suspend-before-715');
     }
+  });
+
+  powerMonitor.on('resume', () => {
+    log.info('[lifecycle] System resumed from suspend/sleep');
+    if (!mainWindow) return;
+    mainWindow.webContents.send('system-resume');
   });
 
   powerMonitor.on('shutdown', () => {
