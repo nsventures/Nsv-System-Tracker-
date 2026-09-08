@@ -8,6 +8,7 @@ interface UseTimeTrackingResult {
   maxBreakTime: number;
   currentBreakDuration: number;
   currentDateTime: Date;
+  isOnBreak: boolean;
 }
 
 function useTimeTracking(
@@ -88,6 +89,7 @@ function useTimeTracking(
     maxBreakTime,
     currentBreakDuration,
     currentDateTime,
+    isOnBreak: activityService.isUserOnBreak(),
   };
 }
 

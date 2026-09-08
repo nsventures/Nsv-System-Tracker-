@@ -19,6 +19,8 @@ import {
   dialog,
   systemPreferences,
   session as electronSession,
+  Notification,
+  nativeImage,
 } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
@@ -51,6 +53,31 @@ if (isLinux) {
       '[DEBUG] Main process: Wayland session detected — using persistent getDisplayMedia capture via PipeWire portal',
     );
   }
+}
+
+const APP_DISPLAY_NAME = 'NS Ventures';
+// Must match package.json build.appId so Windows toast shows the right name.
+const APP_USER_MODEL_ID = 'com.nsventures.systemtracker';
+
+const getAssetsRoot = (): string =>
+  app.isPackaged
+    ? path.join(process.resourcesPath, 'assets')
+    : path.join(__dirname, '../../assets');
+
+const resolveNotificationIcon = (): string | undefined => {
+  const candidates = ['nsv512x512.png', 'nsv-black.png', 'icon.png'];
+  for (const name of candidates) {
+    const fullPath = path.join(getAssetsRoot(), name);
+    if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+  }
+  return undefined;
+};
+
+app.setName(APP_DISPLAY_NAME);
+if (process.platform === 'win32') {
+  app.setAppUserModelId(APP_USER_MODEL_ID);
 }
 
 // Persist logs to userData/logs/main.log with rotation, and capture crashes in
@@ -352,6 +379,48 @@ ipcMain.handle('get-session', () => {
   }
   return null;
 });
+
+ipcMain.handle(
+  'show-notification',
+  async (_event, payload: { title: string; body: string }) => {
+    const title = payload?.title?.trim() || APP_DISPLAY_NAME;
+    const body = payload?.body?.trim() || '';
+
+    if (!Notification.isSupported()) {
+      console.warn('[DEBUG] Main process: Notifications not supported');
+      return { shown: false };
+    }
+
+    if (process.platform === 'darwin') {
+      const status = systemPreferences.getNotificationPermissionStatus?.();
+      if (status === 'denied') {
+        console.warn('[DEBUG] Main process: Notification permission denied');
+        return { shown: false };
+      }
+      if (
+        status === 'notDetermined' &&
+        systemPreferences.requestNotificationPermission
+      ) {
+        await systemPreferences.requestNotificationPermission();
+      }
+    }
+
+    const iconPath = resolveNotificationIcon();
+    const icon =
+      iconPath && !nativeImage.createFromPath(iconPath).isEmpty()
+        ? iconPath
+        : undefined;
+
+    const notification = new Notification({
+      title,
+      body,
+      icon,
+      silent: false,
+    });
+    notification.show();
+    return { shown: true };
+  },
+);
 
 // Handle IPC messages from renderer
 ipcMain.on('ipc-example', async (event, arg) => {

@@ -156,15 +156,6 @@ class ScreenshotService {
         return;
       }
 
-      // Check if user is on break
-      console.log('[DEBUG] Checking if user is on break');
-      const isUserOnBreak = activityService.isUserOnBreak();
-      console.log(`[DEBUG] User on break status: ${isUserOnBreak}`);
-      if (isUserOnBreak) {
-        console.log('[DEBUG] Skipping screenshot: user is on break');
-        return;
-      }
-
       // Take a screenshot. On Wayland this grabs a frame from the held
       // getDisplayMedia stream; elsewhere it goes through desktopCapturer.
       console.log('[DEBUG] Calling capture path to take screenshot');

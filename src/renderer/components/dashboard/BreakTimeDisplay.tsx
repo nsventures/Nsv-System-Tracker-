@@ -16,6 +16,8 @@ function BreakTimeDisplay({
   currentBreakDuration,
   isOnBreak,
 }: BreakTimeDisplayProps): React.ReactElement {
+  const atCap = remainingBreakTime <= 0;
+
   return (
     <div className="break-time-display">
       <div className="break-time-row">
@@ -30,7 +32,7 @@ function BreakTimeDisplay({
           {formatMilliseconds(remainingBreakTime)}
         </div>
       </div>
-      {isOnBreak && (
+      {isOnBreak && !atCap && (
         <div className="break-time-row">
           <div className="break-time-label">Current Break Duration:</div>
           <div className="break-time-value">
@@ -38,7 +40,17 @@ function BreakTimeDisplay({
           </div>
         </div>
       )}
-      <div className="break-time-progress">
+      {isOnBreak && atCap && (
+        <div className="break-time-row">
+          <div className="break-time-label">Current Break Duration:</div>
+          <div className="break-time-value break-time-value--at-cap">
+            Break limit reached
+          </div>
+        </div>
+      )}
+      <div
+        className={`break-time-progress${atCap ? ' break-time-progress--at-cap' : ''}`}
+      >
         <div
           className="break-time-progress-bar"
           style={{

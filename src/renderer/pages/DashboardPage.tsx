@@ -25,7 +25,7 @@ function DashboardPage(): React.ReactElement | null {
   const {
     activityLogs,
     isClockedIn,
-    isOnBreak,
+    isOnBreak: logsOnBreak,
     clockInTime,
     historyDuration,
     refreshLogs,
@@ -38,7 +38,13 @@ function DashboardPage(): React.ReactElement | null {
     maxBreakTime,
     currentBreakDuration,
     currentDateTime,
-  } = useTimeTracking(isClockedIn, clockInTime, isOnBreak, historyDuration);
+    isOnBreak,
+  } = useTimeTracking(
+    isClockedIn,
+    clockInTime,
+    logsOnBreak,
+    historyDuration,
+  );
 
   const toggleDropdown = () => {
     setIsDropdownOpen(!isDropdownOpen);
@@ -150,6 +156,7 @@ function DashboardPage(): React.ReactElement | null {
         isClockedIn={isClockedIn}
         isOnBreak={isOnBreak}
         isOnManualTime={isOnManualTime}
+        remainingBreakTime={remainingBreakTime}
         onClockInOut={handleClockInOut}
         onBreak={handleBreak}
         onManualTime={handleManualTime}

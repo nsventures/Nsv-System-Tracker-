@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ActivityLog } from '../types';
-import { databaseService } from '../services';
+import { activityService, databaseService } from '../services';
 import { deriveClockState } from '../utils/clockState';
 
 interface UseActivityLogsResult {
@@ -148,7 +148,13 @@ function useActivityLogs(userId: number | undefined): UseActivityLogsResult {
         console.log(
           `[DEBUG] useActivityLogs: User is ${isOnBreakNow ? 'on break' : 'not on break'}`,
         );
-        setIsOnBreak(isOnBreakNow);
+        const serviceOnBreak = activityService.isUserOnBreak();
+        const remainingBreakMs = activityService.getRemainingBreakTime();
+        // Trust the live service when the cap is exhausted — log rows can lag
+        // behind stopBreak/clock-out and make the UI flicker "on break".
+        setIsOnBreak(
+          serviceOnBreak || (isOnBreakNow && remainingBreakMs > 0),
+        );
       } else {
         console.log(
           '[DEBUG] useActivityLogs: No break logs found for this user, user is not on break',

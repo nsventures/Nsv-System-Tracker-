@@ -46,7 +46,20 @@ class ActivityService {
   // after every 5-minute wait.
   private static readonly IDLE_RESUME_MS = 5000;
 
+  // Require this many consecutive polls (5s each) above threshold before
+  // idle-start. Stops a single bad OS idle reading from marking someone idle
+  // while they are still working (RDP/dock/Bluetooth keyboard glitches).
+  private static readonly IDLE_CONFIRM_POLLS = 2;
+
+  private idleAboveThresholdPolls: number = 0;
+
   private breakThreshold: number = 300000; // Default 5 minutes
+
+  /** TEMP QA — set false before shipping to users. */
+  private static readonly QA_SHORT_BREAK_CAP_ENABLED = true;
+
+  /** 2 minutes — fast QA for auto clock-out at daily break cap. */
+  private static readonly QA_MAX_DAILY_BREAK_MS = 120000;
 
   private maxDailyBreakTime: number = 3600000; // Default 1 hour
 
@@ -91,6 +104,7 @@ class ActivityService {
 
     // Load persisted break time from config
     await this.loadPersistedBreakTime();
+    await this.prepareQaBreakCapTesting();
 
     // Restore break/idle state from database logs before polling starts
     await this.restoreBreakState();
@@ -459,11 +473,16 @@ class ActivityService {
     }
   }
 
-  /** After sleep/wake: close idle that was opened on suspend if the user is back. */
+  /** After sleep/wake: enforce break cap, then close idle opened on suspend. */
   public async markAsIdleAfterResume() {
     try {
       const clockedIn = await this.isUserClockedIn();
-      if (!clockedIn || this.isOnBreak) return;
+      if (!clockedIn) return;
+
+      if (this.isOnBreak) {
+        const ended = await this.enforceBreakDailyCap();
+        if (ended || this.isOnBreak) return;
+      }
 
       const osIdleMs = await this.getSystemIdleMs();
       if (osIdleMs >= ActivityService.IDLE_RESUME_MS) {
@@ -480,6 +499,50 @@ class ActivityService {
     } catch (error) {
       console.error('Error handling system resume:', error);
     }
+  }
+
+  /** Milliseconds of break allowance left (includes the current break session). */
+  private getRemainingBreakMsIncludingCurrent(): number {
+    let remaining = this.maxDailyBreakTime - this.totalBreakTime;
+    if (this.isOnBreak && this.breakStartTime) {
+      remaining -= Date.now() - this.breakStartTime;
+    }
+    return Math.max(0, remaining);
+  }
+
+  /** Timestamp at which the current break must end to respect the daily cap. */
+  private getBreakStopAtCap(): Date {
+    if (!this.breakStartTime) return new Date();
+    const allowedMs = Math.max(0, this.maxDailyBreakTime - this.totalBreakTime);
+    return new Date(this.breakStartTime + allowedMs);
+  }
+
+  /**
+   * End break at the daily cap if exceeded (e.g. lid closed / sleep froze timers).
+   * When the daily allowance is fully used, clock the user out immediately.
+   */
+  public async enforceBreakDailyCap(): Promise<boolean> {
+    if (!this.isOnBreak || !this.breakStartTime) return false;
+    if (this.getRemainingBreakMsIncludingCurrent() > 0) {
+      this.scheduleBreakLimitTimers();
+      return false;
+    }
+
+    console.log('[break] Daily cap reached — ending break and clocking out');
+    await this.finishBreakAtDailyCap(
+      'Your break has ended and you have been clocked out because you reached your daily break time limit.',
+    );
+    return true;
+  }
+
+  /** Stop break at the cap timestamp; always clock out — only called when cap is hit. */
+  private async finishBreakAtDailyCap(notificationBody: string) {
+    const stopAt = this.getBreakStopAtCap();
+    await this.stopBreak(stopAt, { endedAtDailyCap: true });
+
+    this.showNotification('Daily Break Limit', notificationBody);
+    await this.clockOut();
+    window.dispatchEvent(new CustomEvent('force-clockout'));
   }
 
   // Save break time to config
@@ -563,6 +626,31 @@ class ActivityService {
     );
   }
 
+  /** Server/admin value, or 2 min when QA_SHORT_BREAK_CAP_ENABLED. */
+  private applyMaxDailyBreakTime(fromServer?: number) {
+    const serverMs = fromServer ?? 3600000;
+    if (ActivityService.QA_SHORT_BREAK_CAP_ENABLED) {
+      this.maxDailyBreakTime = ActivityService.QA_MAX_DAILY_BREAK_MS;
+      console.warn(
+        `[QA] Daily break cap overridden to ${ActivityService.QA_MAX_DAILY_BREAK_MS / 60000} min (server: ${serverMs / 60000} min). Set QA_SHORT_BREAK_CAP_ENABLED=false before release.`,
+      );
+    } else {
+      this.maxDailyBreakTime = serverMs;
+    }
+  }
+
+  /** Clear persisted break usage when QA cap is on so tests start with full allowance. */
+  private async prepareQaBreakCapTesting() {
+    if (!ActivityService.QA_SHORT_BREAK_CAP_ENABLED) return;
+    if (this.totalBreakTime <= 0) return;
+
+    console.warn(
+      `[QA] Resetting today's break usage (${this.totalBreakTime}ms) for 2-min cap testing`,
+    );
+    this.totalBreakTime = 0;
+    await this.saveBreakTime();
+  }
+
   private startConfigReload() {
     if (this.configReloadInterval) {
       clearInterval(this.configReloadInterval);
@@ -586,6 +674,7 @@ class ActivityService {
     }
 
     if (!this.token || !this.workspaceId) {
+      this.applyMaxDailyBreakTime();
       console.error('Cannot load config: missing token or workspace ID');
       return;
     }
@@ -599,16 +688,18 @@ class ActivityService {
       if (!response.error && response.data) {
         this.applyIdleThreshold(response.data.idleTimeThreshold, 'server');
         this.breakThreshold = response.data.breakTimeThreshold;
-        this.maxDailyBreakTime = response.data.maxDailyBreakTime || 3600000;
+        this.applyMaxDailyBreakTime(response.data.maxDailyBreakTime);
         console.log(
-          `Configuration loaded successfully (idle threshold ${this.idleThreshold}ms)`,
+          `Configuration loaded successfully (idle threshold ${this.idleThreshold}ms, break cap ${this.maxDailyBreakTime}ms)`,
         );
       } else {
+        this.applyMaxDailyBreakTime();
         console.error(
           `Failed to load configuration: ${response.message} — keeping idle threshold ${this.idleThreshold}ms`,
         );
       }
     } catch (error) {
+      this.applyMaxDailyBreakTime();
       console.error(
         `Error loading configuration: ${error} — keeping idle threshold ${this.idleThreshold}ms`,
       );
@@ -655,7 +746,7 @@ class ActivityService {
         }
 
         // Only track idle when clocked in and not on break
-        if (!clockedIn || this.isOnBreak) {
+        if (!clockedIn) {
           if (this.isIdle) {
             this.isIdle = false;
             await this.logActivity('idle-stop');
@@ -663,16 +754,37 @@ class ActivityService {
           return;
         }
 
-        // NOTE: the idle auto-clock-out was removed. It fired after 30 minutes
-        // idle inside a window hardcoded to 8 PM–6 AM Asia/Kolkata, while the
-        // app records time in each machine's own timezone. On any machine
-        // outside India that window fell across the working day, so an ordinary
-        // idle stretch (lunch, a meeting) silently clocked the user out — and
-        // getSystemIdleTime() over-reports idle on some platforms (Wayland),
-        // tripping it even while the user was active. Idle is now only logged,
-        // never acted on; users clock out themselves or an admin force-clocks.
-        if (!this.isIdle && idleTimeMs >= this.idleThreshold) {
+        if (this.isOnBreak) {
+          await this.enforceBreakDailyCap();
+          if (this.isOnBreak) {
+            if (this.isIdle) {
+              this.isIdle = false;
+              await this.logActivity('idle-stop');
+            }
+            return;
+          }
+          // Break ended at daily cap — clock-out runs inside finishBreakAtDailyCap.
+          return;
+        }
+
+        // Idle is only logged, never acted on; users clock out themselves or
+        // an admin force-clocks. Require consecutive polls above threshold so
+        // one bad OS reading does not mark someone idle while they work.
+        const aboveThreshold = idleTimeMs >= this.idleThreshold;
+
+        if (!aboveThreshold) {
+          this.idleAboveThresholdPolls = 0;
+        } else if (!this.isIdle) {
+          this.idleAboveThresholdPolls += 1;
+        }
+
+        if (
+          !this.isIdle &&
+          aboveThreshold &&
+          this.idleAboveThresholdPolls >= ActivityService.IDLE_CONFIRM_POLLS
+        ) {
           this.isIdle = true;
+          this.idleAboveThresholdPolls = 0;
           // Stamp idle-start at the beginning of this inactivity stretch, not
           // "now". Logging "now" left the threshold wait as Active and then a
           // 1–2 minute Idle leftover when the user returned — which looked
@@ -687,6 +799,7 @@ class ActivityService {
           await this.logActivity('idle-start', new Date(startedAt));
         } else if (this.isIdle && idleTimeMs < ActivityService.IDLE_RESUME_MS) {
           this.isIdle = false;
+          this.idleAboveThresholdPolls = 0;
           await this.logActivity('idle-stop');
         }
       } catch (e) {
@@ -733,46 +846,35 @@ class ActivityService {
     }
   }
 
-  // Check if notifications are supported and request permission if needed
-  // eslint-disable-next-line class-methods-use-this
-  private checkNotificationPermission(): boolean {
-    if (!('Notification' in window)) {
-      console.log('This browser does not support desktop notification');
-      return false;
-    }
-
-    if (Notification.permission === 'granted') {
-      return true;
-    }
-
-    if (Notification.permission !== 'denied') {
-      Notification.requestPermission()
-        .then((permission) => {
-          return permission === 'granted';
-        })
-        .catch((error) => {
-          console.error('Error requesting notification permission:', error);
-          return false;
-        });
-    }
-
-    return false;
-  }
-
-  // Show a notification
+  // Show a desktop notification via the main process (correct app name + icon).
   private showNotification(title: string, body: string): void {
-    if (this.checkNotificationPermission()) {
-      // eslint-disable-next-line no-new
-      new Notification(title, {
-        body,
-        icon: '/assets/icon.png',
-      });
+    if (typeof window !== 'undefined' && window.electron?.system?.showNotification) {
+      void window.electron.system
+        .showNotification(title, body)
+        .catch((error) => {
+          console.error('Error showing notification:', error);
+        });
+      return;
     }
+
+    if (!('Notification' in window) || Notification.permission !== 'granted') {
+      return;
+    }
+
+    new Notification(title, { body });
   }
 
   // Start a break
   private async startBreak() {
     if (this.isOnBreak) return;
+
+    if (this.getRemainingBreakMsIncludingCurrent() <= 0) {
+      this.showNotification(
+        'Cannot Start Break',
+        'You have used all your daily break time.',
+      );
+      return;
+    }
 
     this.isOnBreak = true;
     this.breakStartTime = Date.now();
@@ -802,11 +904,9 @@ class ActivityService {
       this.maxDailyBreakTime - this.totalBreakTime - elapsed;
 
     if (remainingBreakTime <= 0) {
-      this.showNotification(
-        'Break Ended',
-        'Your break has ended automatically because you have used all your daily break time.',
+      void this.finishBreakAtDailyCap(
+        'Your break has ended and you have been clocked out because you used all your daily break time.',
       );
-      void this.stopBreak();
       return;
     }
 
@@ -823,23 +923,37 @@ class ActivityService {
 
     this.breakEndTimeout = setTimeout(() => {
       if (this.isOnBreak) {
-        this.showNotification(
-          'Break Ended',
-          'Your break has ended automatically because you reached your daily break time limit.',
+        void this.finishBreakAtDailyCap(
+          'Your break has ended and you have been clocked out because you reached your daily break time limit.',
         );
-        void this.stopBreak();
       }
     }, remainingBreakTime);
   }
-
-  // Stop a break
-  private async stopBreak(at: Date = new Date()) {
+  private async stopBreak(
+    at: Date = new Date(),
+    options?: { endedAtDailyCap?: boolean },
+  ) {
     if (!this.isOnBreak || !this.breakStartTime) return;
 
     this.clearBreakTimers();
 
-    const breakDuration = Math.max(0, at.getTime() - this.breakStartTime);
-    this.totalBreakTime += breakDuration;
+    const maxAllowedMs = Math.max(
+      0,
+      this.maxDailyBreakTime - this.totalBreakTime,
+    );
+    const rawDurationMs = Math.max(0, at.getTime() - this.breakStartTime);
+    const breakDurationMs = Math.min(rawDurationMs, maxAllowedMs);
+    const stopAt = new Date(this.breakStartTime + breakDurationMs);
+
+    this.totalBreakTime = Math.min(
+      this.totalBreakTime + breakDurationMs,
+      this.maxDailyBreakTime,
+    );
+    if (options?.endedAtDailyCap) {
+      // Timer drift can leave totalBreakTime a few ms under the cap and skip
+      // clock-out when checked after stopBreak. Snap to the cap on auto-end.
+      this.totalBreakTime = this.maxDailyBreakTime;
+    }
     this.isOnBreak = false;
     this.breakStartTime = null;
 
@@ -854,10 +968,12 @@ class ActivityService {
     // Save updated break time to config
     await this.saveBreakTime();
 
-    await this.logActivity('break-stop', at);
+    await this.logActivity('break-stop', stopAt);
 
-    // Dispatch event to notify UI that break ended
-    window.dispatchEvent(new CustomEvent('break-ended'));
+    // Cap auto-end flows dispatch force-clockout after clock-out instead.
+    if (!options?.endedAtDailyCap) {
+      window.dispatchEvent(new CustomEvent('break-ended'));
+    }
   }
 
   public async logActivity(action: ActivityAction, at: Date = new Date()) {
@@ -946,6 +1062,15 @@ class ActivityService {
       await this.logActivity('idle-stop');
       this.isIdle = false;
     }
+
+    if (this.getRemainingBreakMsIncludingCurrent() <= 0) {
+      this.showNotification(
+        'Cannot Start Break',
+        'You have used all your daily break time.',
+      );
+      return;
+    }
+
     await this.startBreak();
   }
 
@@ -1036,14 +1161,23 @@ class ActivityService {
     await this.saveBreakTime();
   }
 
-  // Get total break time used
+  // Get total break time used today (includes in-progress break, capped at max)
   public getTotalBreakTime(): number {
-    return this.totalBreakTime;
+    let total = this.totalBreakTime;
+    if (this.isOnBreak && this.breakStartTime) {
+      const elapsed = Date.now() - this.breakStartTime;
+      const maxForSession = Math.max(
+        0,
+        this.maxDailyBreakTime - this.totalBreakTime,
+      );
+      total += Math.min(elapsed, maxForSession);
+    }
+    return Math.min(total, this.maxDailyBreakTime);
   }
 
   // Get remaining break time
   public getRemainingBreakTime(): number {
-    return Math.max(0, this.maxDailyBreakTime - this.totalBreakTime);
+    return this.getRemainingBreakMsIncludingCurrent();
   }
 
   // Get max daily break time
@@ -1051,12 +1185,17 @@ class ActivityService {
     return this.maxDailyBreakTime;
   }
 
-  // Get current break duration (if on break)
+  // Get current break duration (if on break), capped at today's remaining allowance
   public getCurrentBreakDuration(): number {
     if (!this.isOnBreak || !this.breakStartTime) {
       return 0;
     }
-    return Date.now() - this.breakStartTime;
+    const elapsed = Date.now() - this.breakStartTime;
+    const maxForSession = Math.max(
+      0,
+      this.maxDailyBreakTime - this.totalBreakTime,
+    );
+    return Math.min(elapsed, maxForSession);
   }
 
   // Check if user is on break

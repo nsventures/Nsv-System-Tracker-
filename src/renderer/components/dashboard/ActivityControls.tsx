@@ -4,6 +4,7 @@ interface ActivityControlsProps {
   isClockedIn: boolean;
   isOnBreak: boolean;
   isOnManualTime: boolean;
+  remainingBreakTime: number;
   onClockInOut: () => void;
   onBreak: () => void;
   onManualTime: () => void;
@@ -13,6 +14,7 @@ function ActivityControls({
   isClockedIn,
   isOnBreak,
   isOnManualTime,
+  remainingBreakTime,
   onClockInOut,
   onBreak,
   onManualTime,
@@ -30,7 +32,7 @@ function ActivityControls({
       <button
         onClick={onBreak}
         className={`break-button ${isOnBreak ? 'on-break' : ''}`}
-        disabled={!isClockedIn}
+        disabled={!isClockedIn || (!isOnBreak && remainingBreakTime <= 0)}
         type="button"
       >
         {isOnBreak ? 'End Break' : 'Start Break'}

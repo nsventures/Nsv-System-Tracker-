@@ -24,7 +24,8 @@ export type Channels =
   | 'get-session'
   | 'get-display-env'
   | 'save-screenshot-buffer'
-  | 'log-error';
+  | 'log-error'
+  | 'show-notification';
 
 const electronHandler = {
   ipcRenderer: {
@@ -112,6 +113,13 @@ const electronHandler = {
     ): Promise<{ error: boolean; message: string; filePath: string }> => {
       return ipcRenderer.invoke('save-screenshot-buffer', base64Data);
     },
+
+    showNotification: (
+      title: string,
+      body: string,
+    ): Promise<{ shown: boolean }> => {
+      return ipcRenderer.invoke('show-notification', { title, body });
+    },
   },
 };
 
@@ -142,5 +150,9 @@ export interface ElectronHandler {
     saveScreenshotBuffer(
       base64Data: string,
     ): Promise<{ error: boolean; message: string; filePath: string }>;
+    showNotification(
+      title: string,
+      body: string,
+    ): Promise<{ shown: boolean }>;
   };
 }
