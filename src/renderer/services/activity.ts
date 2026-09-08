@@ -620,8 +620,47 @@ class ActivityService {
   }
 
   /** Server/admin daily break cap (default 1 hour). */
-  private applyMaxDailyBreakTime(fromServer?: number) {
-    this.maxDailyBreakTime = fromServer ?? 3600000;
+  private applyMaxDailyBreakTime(
+    raw?: unknown,
+    source: 'server' | 'local' | 'default' = 'default',
+  ) {
+    const DEFAULT_MS = 3600000;
+    const QA_POISON_MS = 120000;
+
+    if (raw === undefined || raw === null) {
+      this.maxDailyBreakTime = DEFAULT_MS;
+      console.log(
+        `[break] cap set to ${DEFAULT_MS}ms (source=${source}, default)`,
+      );
+      return;
+    }
+
+    const n = Number(raw);
+    let ms = Number.isFinite(n) && n > 0 ? n : DEFAULT_MS;
+
+    // Admin may send seconds (3600 = 1 h) instead of ms.
+    if (ms < 60000) {
+      ms *= 1000;
+    }
+
+    // Dev QA builds cached a 2-minute cap locally — do not carry that into prod.
+    if (source === 'local' && ms === QA_POISON_MS) {
+      console.warn(
+        '[break] Ignoring cached maxDailyBreakTime=120000 (QA); using 1-hour default until server config applies',
+      );
+      ms = DEFAULT_MS;
+    }
+
+    this.maxDailyBreakTime = ms;
+    if (source === 'server' && ms === QA_POISON_MS) {
+      console.warn(
+        '[break] Server returned maxDailyBreakTime=120000 (2 min). ' +
+          'Update admin /load-config to 3600000 (ms) or 3600 (seconds) for a 1-hour cap.',
+      );
+    }
+    console.log(
+      `[break] cap set to ${this.maxDailyBreakTime}ms (source=${source})`,
+    );
   }
 
   /** Apply screenshot interval from config (default 1 min until server responds). */
@@ -650,16 +689,16 @@ class ActivityService {
       if (local?.breakTimeThreshold) {
         this.breakThreshold = local.breakTimeThreshold;
       }
-      if (local?.maxDailyBreakTime) {
-        this.applyMaxDailyBreakTime(local.maxDailyBreakTime);
-      }
+      // Do not apply local maxDailyBreakTime here — stale QA values (120000)
+      // survive in IndexedDB and override the server on every launch until
+      // /load-config returns. Offline fallback runs after the server attempt.
       this.applyScreenshotInterval(local?.screenshotInterval);
     } catch (error) {
       console.error('Error reading local config:', error);
     }
 
     if (!this.token || !this.workspaceId) {
-      this.applyMaxDailyBreakTime();
+      this.applyMaxDailyBreakTime(undefined, 'default');
       console.error('Cannot load config: missing token or workspace ID');
       return;
     }
@@ -671,21 +710,46 @@ class ActivityService {
       );
 
       if (!response.error && response.data) {
+        const configSource: 'server' | 'local' =
+          response.message?.includes('local storage') ? 'local' : 'server';
+        console.log(
+          `[config] load-config raw (${configSource}): maxDailyBreakTime=${response.data.maxDailyBreakTime}, idleTimeThreshold=${response.data.idleTimeThreshold}, screenshotInterval=${response.data.screenshotInterval}`,
+        );
         this.applyIdleThreshold(response.data.idleTimeThreshold, 'server');
         this.breakThreshold = response.data.breakTimeThreshold || 300000;
-        this.applyMaxDailyBreakTime(response.data.maxDailyBreakTime);
+        this.applyMaxDailyBreakTime(
+          response.data.maxDailyBreakTime,
+          configSource,
+        );
         this.applyScreenshotInterval(response.data.screenshotInterval);
         console.log(
           `Configuration loaded successfully (idle ${this.idleThreshold}ms, break cap ${this.maxDailyBreakTime}ms, screenshot ${response.data.screenshotInterval ?? 60000}ms)`,
         );
+
+        // Persist the resolved break cap so a stale IndexedDB QA value (120000)
+        // cannot survive the next offline startup.
+        try {
+          const stored = await databaseService.getConfig();
+          if (
+            stored &&
+            stored.maxDailyBreakTime !== this.maxDailyBreakTime
+          ) {
+            await databaseService.saveConfig({
+              ...stored,
+              maxDailyBreakTime: this.maxDailyBreakTime,
+            });
+          }
+        } catch (persistError) {
+          console.error('Error persisting resolved break cap:', persistError);
+        }
       } else {
-        this.applyMaxDailyBreakTime();
+        this.applyMaxDailyBreakTime(undefined, 'default');
         console.error(
           `Failed to load configuration: ${response.message} — keeping idle threshold ${this.idleThreshold}ms`,
         );
       }
     } catch (error) {
-      this.applyMaxDailyBreakTime();
+      this.applyMaxDailyBreakTime(undefined, 'default');
       console.error(
         `Error loading configuration: ${error} — keeping idle threshold ${this.idleThreshold}ms`,
       );

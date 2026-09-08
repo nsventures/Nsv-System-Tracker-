@@ -193,6 +193,10 @@ export async function loadConfig(
       ...existingConfig,
       ...response.data,
     };
+    // If the server omits maxDailyBreakTime, do not keep a stale local QA value.
+    if (response.data.maxDailyBreakTime == null) {
+      mergedConfig.maxDailyBreakTime = 3600000;
+    }
     // Save config to IndexedDB for offline use
     // eslint-disable-next-line import/no-named-as-default-member
     await databaseService.saveConfig(mergedConfig);
