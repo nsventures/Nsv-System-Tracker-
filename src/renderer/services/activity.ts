@@ -55,12 +55,6 @@ class ActivityService {
 
   private breakThreshold: number = 300000; // Default 5 minutes
 
-  /** TEMP QA — set false before shipping to users. */
-  private static readonly QA_SHORT_BREAK_CAP_ENABLED = true;
-
-  /** 2 minutes — fast QA for auto clock-out at daily break cap. */
-  private static readonly QA_MAX_DAILY_BREAK_MS = 120000;
-
   private maxDailyBreakTime: number = 3600000; // Default 1 hour
 
   private isIdle: boolean = false;
@@ -104,7 +98,6 @@ class ActivityService {
 
     // Load persisted break time from config
     await this.loadPersistedBreakTime();
-    await this.prepareQaBreakCapTesting();
 
     // Restore break/idle state from database logs before polling starts
     await this.restoreBreakState();
@@ -552,7 +545,7 @@ class ActivityService {
       // might still be a pre-config-load value — always persist the 5-minute
       // product default (or whatever already came from /load-config).
       const config = (await databaseService.getConfig()) || {
-        screenshotInterval: 300000,
+        screenshotInterval: 60000,
         idleTimeThreshold: 300000,
         breakTimeThreshold: this.breakThreshold,
         maxDailyBreakTime: this.maxDailyBreakTime,
@@ -626,29 +619,14 @@ class ActivityService {
     );
   }
 
-  /** Server/admin value, or 2 min when QA_SHORT_BREAK_CAP_ENABLED. */
+  /** Server/admin daily break cap (default 1 hour). */
   private applyMaxDailyBreakTime(fromServer?: number) {
-    const serverMs = fromServer ?? 3600000;
-    if (ActivityService.QA_SHORT_BREAK_CAP_ENABLED) {
-      this.maxDailyBreakTime = ActivityService.QA_MAX_DAILY_BREAK_MS;
-      console.warn(
-        `[QA] Daily break cap overridden to ${ActivityService.QA_MAX_DAILY_BREAK_MS / 60000} min (server: ${serverMs / 60000} min). Set QA_SHORT_BREAK_CAP_ENABLED=false before release.`,
-      );
-    } else {
-      this.maxDailyBreakTime = serverMs;
-    }
+    this.maxDailyBreakTime = fromServer ?? 3600000;
   }
 
-  /** Clear persisted break usage when QA cap is on so tests start with full allowance. */
-  private async prepareQaBreakCapTesting() {
-    if (!ActivityService.QA_SHORT_BREAK_CAP_ENABLED) return;
-    if (this.totalBreakTime <= 0) return;
-
-    console.warn(
-      `[QA] Resetting today's break usage (${this.totalBreakTime}ms) for 2-min cap testing`,
-    );
-    this.totalBreakTime = 0;
-    await this.saveBreakTime();
+  /** Apply screenshot interval from config (default 1 min until server responds). */
+  private applyScreenshotInterval(intervalMs?: number) {
+    screenshotService.updateInterval(intervalMs ?? 60000);
   }
 
   private startConfigReload() {
@@ -669,6 +647,13 @@ class ActivityService {
       if (local?.idleTimeThreshold) {
         this.applyIdleThreshold(local.idleTimeThreshold, 'local');
       }
+      if (local?.breakTimeThreshold) {
+        this.breakThreshold = local.breakTimeThreshold;
+      }
+      if (local?.maxDailyBreakTime) {
+        this.applyMaxDailyBreakTime(local.maxDailyBreakTime);
+      }
+      this.applyScreenshotInterval(local?.screenshotInterval);
     } catch (error) {
       console.error('Error reading local config:', error);
     }
@@ -687,10 +672,11 @@ class ActivityService {
 
       if (!response.error && response.data) {
         this.applyIdleThreshold(response.data.idleTimeThreshold, 'server');
-        this.breakThreshold = response.data.breakTimeThreshold;
+        this.breakThreshold = response.data.breakTimeThreshold || 300000;
         this.applyMaxDailyBreakTime(response.data.maxDailyBreakTime);
+        this.applyScreenshotInterval(response.data.screenshotInterval);
         console.log(
-          `Configuration loaded successfully (idle threshold ${this.idleThreshold}ms, break cap ${this.maxDailyBreakTime}ms)`,
+          `Configuration loaded successfully (idle ${this.idleThreshold}ms, break cap ${this.maxDailyBreakTime}ms, screenshot ${response.data.screenshotInterval ?? 60000}ms)`,
         );
       } else {
         this.applyMaxDailyBreakTime();

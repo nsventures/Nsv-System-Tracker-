@@ -7,7 +7,7 @@ import whiteLabelConfig from '../../whiteLabel.config';
 import { formatApiTimestamp } from '../utils/timeUtils';
 
 class ScreenshotService {
-  private screenshotInterval: number = 300000; // Default: 5 minutes (in milliseconds)
+  private screenshotInterval: number = 60000; // Default: 1 minute (in milliseconds)
 
   private intervalId: NodeJS.Timeout | null = null;
 
@@ -65,12 +65,9 @@ class ScreenshotService {
         this.useDisplayMedia = false;
       }
 
-      // Get config
+      // Get config (falls back to 1-minute default until /load-config applies)
       const config = await databaseService.getConfig();
-      if (config && config.screenshotInterval) {
-        // Convert from seconds to milliseconds
-        this.screenshotInterval = config.screenshotInterval;
-      }
+      this.screenshotInterval = config?.screenshotInterval ?? 60000;
 
       console.log(
         `[DEBUG] Screenshot interval set to ${this.screenshotInterval / 1000} seconds`,
